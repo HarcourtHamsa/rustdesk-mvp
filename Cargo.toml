@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["protocol", "host", "client", "relay"]
+
+[profile.release]
+opt-level = 3
+lto = true

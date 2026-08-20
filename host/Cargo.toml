@@ -1,0 +1,18 @@
+[package]
+name = "rd-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rd-host"
+path = "src/main.rs"
+
+[dependencies]
+rd-protocol = { path = "../protocol" }
+rd-relay = { path = "../relay" }
+scrap = "0.5"
+image = { version = "0.24", default-features = false, features = ["jpeg"] }
+enigo = "0.1"
+rand = "0.8"
+eframe = "0.35.0"
+egui = "0.35.0"

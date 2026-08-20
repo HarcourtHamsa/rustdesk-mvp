@@ -1,0 +1,15 @@
+[package]
+name = "rd-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rd-client"
+path = "src/main.rs"
+
+[dependencies]
+rd-protocol = { path = "../protocol" }
+image = { version = "0.24", default-features = false, features = ["jpeg"] }
+minifb = "0.25"
+eframe = "0.35.0"
+egui = "0.35.0"
