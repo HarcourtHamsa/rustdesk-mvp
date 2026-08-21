@@ -43,6 +43,21 @@ pub enum ClientMessage {
     /// screen instead of the real desktop, while this client keeps seeing
     /// and controlling the real thing. Windows-only on the host side.
     ToggleBlankScreen { enabled: bool },
+    /// Toggle whether the host applies mouse/keyboard input from this
+    /// connection. While blocked, the host keeps streaming frames as
+    /// normal - it's a "view only" mode, not a pause of the session -
+    /// it just silently drops MouseMove/MouseButton/MouseScroll/Key
+    /// until unblocked again. Lets whoever's driving the client keep an
+    /// eye on the host without risking an accidental click/keystroke
+    /// landing on it (e.g. while just watching, or resting a hand on the
+    /// mouse/keyboard).
+    BlockGuestInput { blocked: bool },
+    /// Toggle whether the host forwards its own physical keystrokes to
+    /// this client, for a "what's being typed on the host" log. This is
+    /// the reverse direction from - and independent of - the normal `Key`
+    /// messages above (those are keys the client sends *to* the host).
+    /// Windows-only on the host side, same as `ToggleBlankScreen`.
+    ToggleKeystrokeLog { enabled: bool },
     Disconnect,
 }
 
@@ -71,6 +86,31 @@ pub enum HostMessage {
         enabled: bool,
         ok: bool,
         reason: Option<String>,
+    },
+    /// Reply to `ClientMessage::BlockGuestInput`, confirming the new state.
+    /// Unlike blank-screen this can't really fail (it's just a flag the
+    /// host's input loop checks), but it's still an explicit reply rather
+    /// than the client assuming success, so the toggle only flips once the
+    /// host has actually applied it.
+    GuestInputBlockedResult {
+        blocked: bool,
+    },
+    /// Reply to `ClientMessage::ToggleKeystrokeLog`, confirming the new
+    /// state - this genuinely can fail (non-Windows host, or the hook
+    /// failing to install), so unlike `GuestInputBlockedResult` it carries
+    /// an `ok`/`reason`, same shape as `BlankScreenResult`.
+    KeystrokeLogResult {
+        enabled: bool,
+        ok: bool,
+        reason: Option<String>,
+    },
+    /// One physical keystroke observed on the host while keystroke
+    /// logging is enabled. `key` is a portable key name (see `map_key`
+    /// mapping the other direction), `timestamp_ms` is milliseconds since
+    /// the Unix epoch, set by the host at the moment of the keypress.
+    Keystroke {
+        key: String,
+        timestamp_ms: u64,
     },
 }
 

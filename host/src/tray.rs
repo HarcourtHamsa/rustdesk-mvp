@@ -306,7 +306,11 @@ mod imp {
             let mut bmi: BITMAPINFO = std::mem::zeroed();
             bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
             bmi.bmiHeader.biWidth = size;
-            bmi.bmiHeader.biHeight = size;
+            // Negative height selects a top-down DIB, matching the row
+            // order `image::RgbaImage` already uses - without this we'd
+            // need to flip the logo's rows manually (a plain circle didn't
+            // care about orientation, but the actual logo does).
+            bmi.bmiHeader.biHeight = -size;
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
@@ -329,21 +333,34 @@ mod imp {
 
             let pixels =
                 std::slice::from_raw_parts_mut(bits_ptr as *mut u32, (size * size) as usize);
-            let center = size as f32 / 2.0;
-            let radius = size as f32 / 2.0 - 1.0;
-            for y in 0..size {
-                for x in 0..size {
-                    let dx = x as f32 + 0.5 - center;
-                    let dy = y as f32 + 0.5 - center;
-                    let idx = (y * size + x) as usize;
-                    // 0xAARRGGBB as a little-endian u32 lands in memory as
-                    // [B, G, R, A], matching the BGRA layout a 32bpp DIB
-                    // expects.
-                    pixels[idx] = if dx * dx + dy * dy <= radius * radius {
-                        0xFF5ADC78
-                    } else {
-                        0x00000000
-                    };
+            match crate::gui_core::load_logo_rgba(size as u32) {
+                Some(rgba) => {
+                    for (i, px) in rgba.chunks_exact(4).enumerate() {
+                        let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+                        // 0xAARRGGBB as a little-endian u32 lands in memory
+                        // as [B, G, R, A], matching the BGRA layout a 32bpp
+                        // DIB expects.
+                        pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
+                }
+                None => {
+                    // Shouldn't happen - the logo is baked in at compile
+                    // time - but fall back to a plain dot rather than a
+                    // blank/garbage icon if it ever does.
+                    let center = size as f32 / 2.0;
+                    let radius = size as f32 / 2.0 - 1.0;
+                    for y in 0..size {
+                        for x in 0..size {
+                            let dx = x as f32 + 0.5 - center;
+                            let dy = y as f32 + 0.5 - center;
+                            let idx = (y * size + x) as usize;
+                            pixels[idx] = if dx * dx + dy * dy <= radius * radius {
+                                0xFF5ADC78
+                            } else {
+                                0x00000000
+                            };
+                        }
+                    }
                 }
             }
 

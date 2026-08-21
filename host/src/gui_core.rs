@@ -19,6 +19,25 @@ pub struct Status {
     pub connected_peer: Option<String>,
 }
 
+/// Decodes the shared branding logo (baked in at compile time), letterboxes
+/// it onto a transparent square canvas so the whole mark survives instead
+/// of being cropped, and resizes to `size`x`size`. Used for both the
+/// window icon (`gui.rs`) and the tray icon (`tray.rs`), so it lives here
+/// rather than duplicated in both.
+///
+/// Returns `None` only if the embedded PNG somehow fails to decode - it's
+/// baked in at compile time, so that would mean the file itself is corrupt.
+pub fn load_logo_rgba(size: u32) -> Option<Vec<u8>> {
+    let bytes = include_bytes!("../../assets/logo.png");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    let side = w.max(h);
+    let mut canvas = image::RgbaImage::new(side, side);
+    image::imageops::overlay(&mut canvas, &img, ((side - w) / 2) as i64, ((side - h) / 2) as i64);
+    let resized = image::imageops::resize(&canvas, size, size, image::imageops::FilterType::Lanczos3);
+    Some(resized.into_raw())
+}
+
 /// How the ngrok tunnel is coming along, polled from its local API.
 pub enum NgrokState {
     Starting,

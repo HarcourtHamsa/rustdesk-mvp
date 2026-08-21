@@ -12,18 +12,21 @@
 //! scripted or headless use (e.g. running `rd-relay`/`rd-host relay` on a
 //! VPS with no display).
 
-use crate::gui_core::{start_hosting, stop_hosting, HostControl, NgrokState};
+use crate::gui_core::{load_logo_rgba, start_hosting, stop_hosting, HostControl, NgrokState};
 use eframe::egui;
 use std::time::Duration;
 
+const ICON_SIZE: u32 = 256;
+
 pub fn run() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 440.0])
-            .with_min_inner_size([320.0, 400.0])
-            .with_resizable(false),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([360.0, 440.0])
+        .with_min_inner_size([320.0, 400.0])
+        .with_resizable(false);
+    if let Some(rgba) = load_logo_rgba(ICON_SIZE) {
+        viewport = viewport.with_icon(egui::IconData { width: ICON_SIZE, height: ICON_SIZE, rgba });
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "rd-host",
         options,

@@ -24,6 +24,14 @@
 //! the client was typing into, breaking remote control entirely while
 //! blanked (exactly the failure mode this was fixed to avoid).
 //!
+//! (An alternative approach - actually powering the monitor off via
+//! SC_MONITORPOWER instead of drawing an overlay - was tried and reverted:
+//! it eliminates the click-passthrough question entirely since there's no
+//! window in the way, but empirically it also stops our own DXGI capture
+//! from producing new frames at all once the display really sleeps, which
+//! breaks the client's video feed - a worse regression than the one it
+//! was meant to fix.)
+//!
 //! Windows-only: there's no equivalent capture-exclusion mechanism wired
 //! up for macOS/Linux here, so `enable()` just reports it's unsupported
 //! on other platforms.

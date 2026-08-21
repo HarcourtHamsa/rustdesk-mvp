@@ -11,11 +11,11 @@ path = "src/main.rs"
 rd-protocol = { path = "../protocol" }
 rd-relay = { path = "../relay" }
 scrap = "0.5"
-image = { version = "0.24", default-features = false, features = ["jpeg"] }
+image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
 enigo = "0.1"
 rand = "0.8"
 eframe = "0.35.0"
 egui = "0.35.0"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.9", features = ["winuser", "wingdi", "libloaderapi", "errhandlingapi", "windef", "minwindef", "winerror", "shellapi", "winbase", "ntdef", "sysinfoapi", "minwinbase", "handleapi"] }
+winapi = { version = "0.3.9", features = ["winuser", "wingdi", "libloaderapi", "errhandlingapi", "windef", "minwindef", "winerror", "shellapi", "winbase", "ntdef", "sysinfoapi", "minwinbase", "handleapi", "processthreadsapi"] }
