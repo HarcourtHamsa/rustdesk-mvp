@@ -931,11 +931,11 @@ fn show_connected(
         }
 
         // "Blank host screen" toggle: hides the real desktop from anyone
-        // physically at the host machine (shows "Welcome to Onboarding"
-        // there instead) while this client keeps seeing/controlling it.
-        // Host-side support is Windows-only; other hosts reply with an
-        // error, shown below rather than the toggle just silently doing
-        // nothing.
+        // physically at the host machine (shows a fake "Working on
+        // updates" screen there instead) while this client keeps
+        // seeing/controlling it. Host-side support is Windows-only; other
+        // hosts reply with an error, shown below rather than the toggle
+        // just silently doing nothing.
         let (label, pending, enabled, err) = {
             let status = session.blank_screen.lock().unwrap();
             let label = if status.pending {

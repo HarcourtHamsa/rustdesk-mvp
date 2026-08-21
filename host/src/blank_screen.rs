@@ -1,7 +1,8 @@
 //! The "blank host screen" privacy feature: while toggled on, anyone
-//! physically at the host machine sees a full-screen "Welcome to
-//! Onboarding" message instead of the real desktop, while the connected
-//! client keeps seeing and controlling the real thing.
+//! physically at the host machine sees a full-screen fake "Working on
+//! updates" Windows Update screen (spinner, slow-crawling percentage,
+//! "Don't turn off your computer") instead of the real desktop, while the
+//! connected client keeps seeing and controlling the real thing.
 //!
 //! This works by creating a topmost, fullscreen local window and marking
 //! it with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` - a Windows
@@ -40,31 +41,63 @@
 mod imp {
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
-    use winapi::shared::windef::{HBRUSH, HWND};
+    use winapi::shared::windef::{HBRUSH, HDC, HWND, RECT};
     use winapi::shared::winerror::ERROR_CLASS_ALREADY_EXISTS;
     use winapi::um::errhandlingapi::GetLastError;
     use winapi::um::libloaderapi::GetModuleHandleW;
     use winapi::um::wingdi::{
-        CreateFontW, DeleteObject, GetStockObject, SelectObject, SetBkMode, SetTextColor, RGB,
-        BLACK_BRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-        FF_SWISS, FW_SEMIBOLD, OUT_DEFAULT_PRECIS, TRANSPARENT,
+        CreateFontW, CreateSolidBrush, DeleteObject, Ellipse, GetStockObject, SelectObject,
+        SetBkMode, SetTextColor, RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+        DEFAULT_PITCH, FF_SWISS, FW_NORMAL, NULL_PEN, OUT_DEFAULT_PRECIS, TRANSPARENT,
     };
     use winapi::shared::windef::HCURSOR;
     use winapi::um::winuser::{
         BeginPaint, CreateCursor, DefWindowProcW, DispatchMessageW, DrawTextW, EndPaint,
-        GetClientRect, GetMessageW, GetSystemMetrics, LoadCursorW, PostMessageW, PostQuitMessage,
-        RegisterClassW, SetCursor, SetProcessDPIAware, SetSystemCursor, ShowCursor, ShowWindow,
-        SystemParametersInfoW, TranslateMessage, UpdateWindow, CW_USEDEFAULT, DT_CENTER,
-        DT_SINGLELINE, DT_VCENTER, HTTRANSPARENT, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN,
-        SPI_SETCURSORS, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_NCHITTEST, WM_PAINT,
-        WM_SETCURSOR, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_POPUP,
+        GetClientRect, GetMessageW, GetSystemMetrics, InvalidateRect, KillTimer, LoadCursorW,
+        PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetProcessDPIAware,
+        SetSystemCursor, SetTimer, ShowCursor, ShowWindow, SystemParametersInfoW,
+        TranslateMessage, UpdateWindow, CW_USEDEFAULT, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+        HTTRANSPARENT, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS,
+        SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER,
+        WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
     use winapi::um::winuser::{CreateWindowExW, SetWindowDisplayAffinity};
+
+    /// Windows Update's signature blue (#0078D7), used as this overlay's
+    /// background - the whole point is to read as a real system screen.
+    const BACKGROUND_COLOR: (u8, u8, u8) = (0, 120, 215);
+
+    /// Id for the periodic repaint timer (only one timer on this window,
+    /// so any nonzero value works).
+    const ANIMATION_TIMER_ID: usize = 1;
+    /// ~20fps - smooth enough for the spinner, cheap enough not to matter.
+    const ANIMATION_TIMER_MS: u32 = 50;
+
+    /// How long the fake progress percentage sits on each number - "very
+    /// slow" is the point, so anyone glancing at it reads it as a real,
+    /// unremarkable update rather than a prop counting up suspiciously
+    /// fast. Caps at 99% (see `fake_percent`) rather than looping back to
+    /// 0, matching how real Windows updates are broadly remembered for
+    /// sitting at 99% seemingly forever.
+    const SECONDS_PER_PERCENT: f64 = 5.0;
+
+    /// When the currently-showing overlay's animation/percent clock
+    /// started - reset every time a new overlay window is created, so each
+    /// activation starts its own fake update back at 0%. A `Mutex` guards
+    /// it since `window_proc` (reading it, on the overlay's own thread) and
+    /// `create_overlay_window` (setting it) both touch it, same reasoning
+    /// as `blank_screen.rs`'s sibling modules use their own statics for.
+    static ANIMATION_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+    /// The fake progress percentage at `elapsed_secs` into this
+    /// activation - see `SECONDS_PER_PERCENT`.
+    fn fake_percent(elapsed_secs: f64) -> u32 {
+        ((elapsed_secs / SECONDS_PER_PERCENT) as u32).min(99)
+    }
 
     /// Added in Windows 10 2004 (SDK 10.0.19041) - not yet in winapi 0.3.9's
     /// constant list, though the function that takes it is. Just a number.
@@ -74,7 +107,8 @@ mod imp {
     /// constant list (it predates the crate; these OCR_* IDs are ancient).
     const OCR_NORMAL: u32 = 32512;
 
-    const MESSAGE: &str = "Welcome to Onboarding";
+    const LINE_1: &str = "Working on updates";
+    const LINE_3: &str = "Don't turn off your computer";
 
     fn wide(s: &str) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
@@ -101,6 +135,73 @@ mod imp {
         }
     }
 
+    /// Draws the six-dot "ring" spinner Windows uses on its own update/
+    /// reset screens: dots evenly spaced around a circle, graduated in
+    /// size from a small "head" to a large "tail" so the ring reads as a
+    /// moving comet rather than six static dots, continuously rotating
+    /// via `elapsed_secs`.
+    fn draw_spinner(hdc: HDC, cx: i32, cy: i32, elapsed_secs: f64) {
+        const NUM_DOTS: i32 = 6;
+        const ORBIT_RADIUS: f64 = 22.0;
+        const MIN_DOT_RADIUS: f64 = 3.0;
+        const MAX_DOT_RADIUS: f64 = 7.0;
+        const REVOLUTIONS_PER_SEC: f64 = 0.6;
+
+        unsafe {
+            let brush = CreateSolidBrush(RGB(255, 255, 255));
+            let old_brush = SelectObject(hdc, brush as _);
+            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN as i32) as _);
+
+            let base_angle = elapsed_secs * REVOLUTIONS_PER_SEC * std::f64::consts::TAU;
+            for i in 0..NUM_DOTS {
+                let angle = base_angle + (i as f64 / NUM_DOTS as f64) * std::f64::consts::TAU;
+                let x = cx as f64 + ORBIT_RADIUS * angle.cos();
+                let y = cy as f64 + ORBIT_RADIUS * angle.sin();
+                // i=0 is the comet's "head" (biggest dot); size tapers
+                // down around the ring from there.
+                let taper = i as f64 / (NUM_DOTS - 1) as f64;
+                let r = MAX_DOT_RADIUS - (MAX_DOT_RADIUS - MIN_DOT_RADIUS) * taper;
+                Ellipse(hdc, (x - r) as i32, (y - r) as i32, (x + r) as i32, (y + r) as i32);
+            }
+
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            DeleteObject(brush as _);
+        }
+    }
+
+    /// Draws one line of centered white Segoe UI text within `rect`.
+    fn draw_text_line(hdc: HDC, text: &str, rect: &mut RECT, point_size: i32) {
+        unsafe {
+            let font_name = wide("Segoe UI");
+            let font = CreateFontW(
+                -point_size,
+                0,
+                0,
+                0,
+                FW_NORMAL as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                OUT_DEFAULT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                CLEARTYPE_QUALITY as u32,
+                (DEFAULT_PITCH | FF_SWISS) as u32,
+                font_name.as_ptr(),
+            );
+            let old_font = SelectObject(hdc, font as _);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, RGB(255, 255, 255));
+
+            let wide_text = wide(text);
+            DrawTextW(hdc, wide_text.as_ptr(), -1, rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(hdc, old_font);
+            DeleteObject(font as _);
+        }
+    }
+
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
         msg: UINT,
@@ -112,43 +213,52 @@ mod imp {
                 let mut ps: winapi::um::winuser::PAINTSTRUCT = std::mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
 
-                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                let mut rect: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut rect);
-                winapi::um::winuser::FillRect(hdc, &rect, GetStockObject(BLACK_BRUSH as i32) as HBRUSH);
 
-                let font_name = wide("Segoe UI");
-                let font = CreateFontW(
-                    -36,
-                    0,
-                    0,
-                    0,
-                    FW_SEMIBOLD as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET as u32,
-                    OUT_DEFAULT_PRECIS as u32,
-                    CLIP_DEFAULT_PRECIS as u32,
-                    CLEARTYPE_QUALITY as u32,
-                    (DEFAULT_PITCH | FF_SWISS) as u32,
-                    font_name.as_ptr(),
-                );
-                let old_font = SelectObject(hdc, font as _);
-                SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, RGB(255, 255, 255));
+                let (r, g, b) = BACKGROUND_COLOR;
+                let bg_brush = CreateSolidBrush(RGB(r, g, b));
+                winapi::um::winuser::FillRect(hdc, &rect, bg_brush as HBRUSH);
+                DeleteObject(bg_brush as _);
 
-                let text = wide(MESSAGE);
-                DrawTextW(
-                    hdc,
-                    text.as_ptr(),
-                    -1,
-                    &mut rect,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                );
+                let elapsed_secs = ANIMATION_START
+                    .lock()
+                    .unwrap()
+                    .map(|start| start.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let percent = fake_percent(elapsed_secs);
 
-                SelectObject(hdc, old_font);
-                DeleteObject(font as _);
+                let center_x = (rect.left + rect.right) / 2;
+                let center_y = (rect.top + rect.bottom) / 2;
+
+                // Spinner, then three lines of text stacked below it - laid
+                // out as fixed offsets from center (like the reference
+                // Windows Update screen), biased upward a bit so the group
+                // as a whole reads as centered rather than the spinner
+                // alone.
+                draw_spinner(hdc, center_x, center_y - 70, elapsed_secs);
+
+                let mut line1_rect =
+                    RECT { left: rect.left, right: rect.right, top: center_y - 6, bottom: center_y + 34 };
+                draw_text_line(hdc, LINE_1, &mut line1_rect, 24);
+
+                let mut line2_rect =
+                    RECT { left: rect.left, right: rect.right, top: center_y + 34, bottom: center_y + 64 };
+                draw_text_line(hdc, &format!("{percent}% complete"), &mut line2_rect, 20);
+
+                let mut line3_rect =
+                    RECT { left: rect.left, right: rect.right, top: center_y + 64, bottom: center_y + 94 };
+                draw_text_line(hdc, LINE_3, &mut line3_rect, 20);
+
                 EndPaint(hwnd, &ps);
+                0
+            }
+            WM_TIMER => {
+                // Nothing to draw here directly - just forces a WM_PAINT so
+                // the spinner keeps rotating and the percentage keeps
+                // ticking over. 0 (don't erase background) avoids a flicker
+                // between this and the FillRect WM_PAINT already does.
+                InvalidateRect(hwnd, std::ptr::null(), 0);
                 0
             }
             WM_NCHITTEST => {
@@ -176,6 +286,11 @@ mod imp {
                 0
             }
             WM_DESTROY => {
+                KillTimer(hwnd, ANIMATION_TIMER_ID);
+                // Cleared so the *next* activation's WM_PAINT (before its
+                // own create_overlay_window has had a chance to set a new
+                // start time) reads elapsed=0 instead of a stale clock.
+                *ANIMATION_START.lock().unwrap() = None;
                 // Balances the ShowCursor(FALSE) from create_overlay_window.
                 ShowCursor(1);
                 // Reload the real system cursors, undoing the blank one
@@ -282,6 +397,12 @@ mod imp {
             // keyboard input while blanked.
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             UpdateWindow(hwnd);
+
+            // Starts this activation's fake update clock at 0% and kicks
+            // off the repaint timer that animates the spinner and advances
+            // the percentage - see ANIMATION_START and WM_TIMER.
+            *ANIMATION_START.lock().unwrap() = Some(Instant::now());
+            SetTimer(hwnd, ANIMATION_TIMER_ID, ANIMATION_TIMER_MS, None);
 
             // The actual mechanism that hides the cursor: swap the real
             // system arrow-cursor resource for a blank one. This is a

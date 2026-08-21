@@ -238,7 +238,8 @@ close the window, to end the session.
 ### Blank host screen (privacy screen)
 
 Next to Disconnect there's a **Blank host screen** toggle. Turning it on
-shows a full-screen "Welcome to Onboarding" message on the *host's own
+shows a full-screen fake "Working on updates" Windows Update screen (spinner,
+slow-crawling percentage, "Don't turn off your computer") on the *host's own
 physical monitor*, with the real mouse cursor hidden too — useful for
 setting up someone's machine remotely without anyone nearby seeing what's
 on screen or watching the cursor move on its own. You (the client) keep

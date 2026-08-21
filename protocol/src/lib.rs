@@ -39,9 +39,10 @@ pub enum ClientMessage {
     /// Client is asking the host to resend the current screen size (e.g. after a resize).
     RequestScreenInfo,
     /// Toggle the "blank host screen" privacy overlay: while on, anyone
-    /// physically at the host machine sees a "Welcome to Onboarding"
-    /// screen instead of the real desktop, while this client keeps seeing
-    /// and controlling the real thing. Windows-only on the host side.
+    /// physically at the host machine sees a fake "Working on updates"
+    /// Windows Update screen instead of the real desktop, while this
+    /// client keeps seeing and controlling the real thing. Windows-only
+    /// on the host side.
     ToggleBlankScreen { enabled: bool },
     /// Toggle whether the host applies mouse/keyboard input from this
     /// connection. While blocked, the host keeps streaming frames as
