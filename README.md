@@ -263,7 +263,9 @@ restores the real cursor — neither can be left stuck.
 This MVP protocol is **not encrypted**, in either direct or relay mode. A
 password gates the connection (hashed before comparison, so the plaintext
 password itself isn't sent — but the hash, plus your screen frames and
-keystrokes, cross the network in the clear). That's fine on a trusted LAN
+keystrokes, cross the network in the clear). The same goes for clipboard
+content if you turn on **Share clipboard** — including anything sensitive
+you copy, like a password from a password manager. That's fine on a trusted LAN
 or over a VPN. It is **not** fine over the open internet — anyone who can
 observe that traffic (including, in relay mode, whoever operates the relay
 box — hopefully just you) can see your screen and your keystrokes.

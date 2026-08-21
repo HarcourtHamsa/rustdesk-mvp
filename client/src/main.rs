@@ -88,6 +88,27 @@ struct KeystrokeLogStatus {
     error: Option<String>,
 }
 
+/// State of the "share clipboard" toggle - whether this client and the
+/// host are currently mirroring clipboard changes onto each other. Same
+/// pending-until-acknowledged shape as `KeystrokeLogStatus` (this can
+/// genuinely fail on the host side too: no display server, a locked
+/// session, etc.).
+struct ClipboardSyncStatus {
+    enabled: bool,
+    pending: bool,
+    error: Option<String>,
+}
+
+/// State of the one-shot "lock host computer" action - `pending` disables
+/// the button while waiting on the host's acknowledgment (so a slow reply
+/// can't be double-fired), `error` carries the reason if the last attempt
+/// failed. No `enabled` field, unlike the toggles above - locking isn't a
+/// state to be on or off, it's a single action.
+struct LockHostStatus {
+    pending: bool,
+    error: Option<String>,
+}
+
 /// One logged keystroke, persisted to disk. `host` is the session's
 /// address (stable even if the session gets renamed later) - the log
 /// panel filters the shared, on-disk history down to entries for
@@ -109,12 +130,25 @@ struct Session {
     blank_screen: Arc<Mutex<BlankScreenStatus>>,
     guest_input: Arc<Mutex<GuestInputStatus>>,
     keystroke_log: Arc<Mutex<KeystrokeLogStatus>>,
+    clipboard_sync: Arc<Mutex<ClipboardSyncStatus>>,
+    /// Newly-detected local clipboard text waiting to be sent to the host -
+    /// written by the clipboard-poll thread below, drained and actually
+    /// sent by the UI thread each frame (see `show_connected`). Only the
+    /// UI thread writes to `stream`, same single-writer design the rest of
+    /// this file uses, so this indirection is what lets a second thread
+    /// (the poller) hand off a value to send without needing a mutex
+    /// around the socket itself.
+    clipboard_outgoing: Arc<Mutex<Option<String>>>,
+    lock_host: Arc<Mutex<LockHostStatus>>,
     /// This session's address, used to tag/filter keystroke log entries -
     /// kept alongside the connection since `Session` itself doesn't know
     /// about `SessionEntry`'s `address` field.
     host_key: String,
     running: Arc<AtomicBool>,
     receiver: Option<std::thread::JoinHandle<()>>,
+    /// Polls this machine's clipboard while sync is enabled - see
+    /// `spawn_clipboard_poller`. Joined in `Drop` alongside `receiver`.
+    clipboard_poll: Option<std::thread::JoinHandle<()>>,
     texture: Option<egui::TextureHandle>,
     uploaded_version: u64,
     last_mouse: Option<(i32, i32)>,
@@ -130,6 +164,9 @@ impl Drop for Session {
         let _ = write_message(&mut self.stream, &ClientMessage::Disconnect);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         if let Some(h) = self.receiver.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.clipboard_poll.take() {
             let _ = h.join();
         }
     }
@@ -907,14 +944,22 @@ fn show_connected(
         return false; // receiver thread ended - connection dropped
     }
 
+    // If the clipboard poller (its own thread - see `spawn_clipboard_poller`)
+    // noticed a local clipboard change since last frame, send it now. Only
+    // the UI thread writes to `session.stream`, so the poller can't just
+    // send it directly - it hands the value off here instead.
+    if let Some(text) = session.clipboard_outgoing.lock().unwrap().take() {
+        let _ = write_message(&mut session.stream, &ClientMessage::ClipboardUpdate { text });
+    }
+
     let mut keep_going = true;
 
-    // All the session controls, stacked one per row rather than packed
-    // into shared horizontal strips - easier to scan, and each button
-    // gets a bit more room to itself (both via the padding bump below and
-    // the spacing between rows).
+    // Collects errors from the toggles below (any of the fallible ones can
+    // report one) so they're shown together underneath the button row,
+    // rather than each toggle needing its own space to grow into.
+    let mut errors: Vec<String> = Vec::new();
+
     ui.vertical(|ui| {
-        ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
         ui.spacing_mut().item_spacing.y = 6.0;
 
         ui.horizontal(|ui| {
@@ -926,98 +971,156 @@ fn show_connected(
         }
         ui.add_space(4.0);
 
-        if ui.button("Disconnect").clicked() {
-            keep_going = false;
-        }
+        // All the session action buttons in one row - wraps to a second
+        // line rather than clipping if the window's too narrow to fit
+        // them all.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
-        // "Blank host screen" toggle: hides the real desktop from anyone
-        // physically at the host machine (shows a fake "Working on
-        // updates" screen there instead) while this client keeps
-        // seeing/controlling it. Host-side support is Windows-only; other
-        // hosts reply with an error, shown below rather than the toggle
-        // just silently doing nothing.
-        let (label, pending, enabled, err) = {
-            let status = session.blank_screen.lock().unwrap();
-            let label = if status.pending {
-                "Blank host screen: ..."
-            } else if status.enabled {
-                "Blank host screen: On"
-            } else {
-                "Blank host screen: Off"
+            if ui.button("Disconnect").clicked() {
+                keep_going = false;
+            }
+
+            // "Blank host screen" toggle: hides the real desktop from
+            // anyone physically at the host machine (shows a fake
+            // "Working on updates" screen there instead) while this
+            // client keeps seeing/controlling it. Host-side support is
+            // Windows-only; other hosts reply with an error, shown below
+            // the row rather than the toggle just silently doing nothing.
+            let (label, pending, enabled, err) = {
+                let status = session.blank_screen.lock().unwrap();
+                let label = if status.pending {
+                    "Blank host screen: ..."
+                } else if status.enabled {
+                    "Blank host screen: On"
+                } else {
+                    "Blank host screen: Off"
+                };
+                (label, status.pending, status.enabled, status.error.clone())
             };
-            (label, status.pending, status.enabled, status.error.clone())
-        };
-        if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
-            session.blank_screen.lock().unwrap().pending = true;
-            let _ = write_message(
-                &mut session.stream,
-                &ClientMessage::ToggleBlankScreen { enabled: !enabled },
-            );
-        }
-        if let Some(e) = err {
+            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+                session.blank_screen.lock().unwrap().pending = true;
+                let _ = write_message(
+                    &mut session.stream,
+                    &ClientMessage::ToggleBlankScreen { enabled: !enabled },
+                );
+            }
+            if let Some(e) = err {
+                errors.push(format!("Blank host screen: {e}"));
+            }
+
+            // "Block guest input" toggle: while on, this client's mouse/
+            // keyboard stop reaching the host (it keeps streaming frames
+            // as normal) - a "view only" mode for when you just want to
+            // watch without risking an accidental click or keystroke
+            // landing on the host.
+            let (label, pending, blocked) = {
+                let status = session.guest_input.lock().unwrap();
+                let label = if status.pending {
+                    "Block guest input: ..."
+                } else if status.blocked {
+                    "Block guest input: On"
+                } else {
+                    "Block guest input: Off"
+                };
+                (label, status.pending, status.blocked)
+            };
+            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+                session.guest_input.lock().unwrap().pending = true;
+                let _ = write_message(
+                    &mut session.stream,
+                    &ClientMessage::BlockGuestInput { blocked: !blocked },
+                );
+            }
+
+            // "Get keyboard keystrokes" toggle: while on, the host
+            // forwards its own physical keystrokes here, persisted to
+            // disk and kept for 1 day. Host-side support is Windows-only,
+            // same caveat as blank screen. The log itself lives in a
+            // separate window (see "View Logs" below) rather than inline
+            // here, so it doesn't push the remote view around.
+            let (label, pending, enabled, err) = {
+                let status = session.keystroke_log.lock().unwrap();
+                let label = if status.pending {
+                    "Get keyboard keystrokes: ..."
+                } else if status.enabled {
+                    "Get keyboard keystrokes: On"
+                } else {
+                    "Get keyboard keystrokes: Off"
+                };
+                (label, status.pending, status.enabled, status.error.clone())
+            };
+            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+                session.keystroke_log.lock().unwrap().pending = true;
+                let _ = write_message(
+                    &mut session.stream,
+                    &ClientMessage::ToggleKeystrokeLog { enabled: !enabled },
+                );
+            }
+            if let Some(e) = err {
+                errors.push(format!("Get keyboard keystrokes: {e}"));
+            }
+
+            // "Share clipboard" toggle: while on, whichever side's
+            // clipboard changes gets mirrored onto the other's - lets a
+            // paste on one end pick up something just copied on the
+            // other. Cross-platform on the host side (unlike blank
+            // screen/keystrokes), but can still fail there (no display
+            // server, a locked session, etc.), same reply shape.
+            let (label, pending, enabled, err) = {
+                let status = session.clipboard_sync.lock().unwrap();
+                let label = if status.pending {
+                    "Share clipboard: ..."
+                } else if status.enabled {
+                    "Share clipboard: On"
+                } else {
+                    "Share clipboard: Off"
+                };
+                (label, status.pending, status.enabled, status.error.clone())
+            };
+            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+                session.clipboard_sync.lock().unwrap().pending = true;
+                let _ = write_message(
+                    &mut session.stream,
+                    &ClientMessage::ToggleClipboardSync { enabled: !enabled },
+                );
+            }
+            if let Some(e) = err {
+                errors.push(format!("Share clipboard: {e}"));
+            }
+
+            // "Lock host computer": one-shot action (not a toggle, unlike
+            // everything above) that immediately locks the host's desktop
+            // session - the same effect as pressing Win+L there. Meant for
+            // e.g. locking your own home laptop back up once you're done
+            // working on it remotely. Windows-only on the host side.
+            let (pending, err) = {
+                let status = session.lock_host.lock().unwrap();
+                (status.pending, status.error.clone())
+            };
+            let label = if pending { "Lock host computer: ..." } else { "Lock host computer" };
+            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+                session.lock_host.lock().unwrap().pending = true;
+                let _ = write_message(&mut session.stream, &ClientMessage::LockHost);
+            }
+            if let Some(e) = err {
+                errors.push(format!("Lock host computer: {e}"));
+            }
+
+            let log_count = keystroke_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.host == session.host_key)
+                .count();
+            if ui.button(format!("View Logs ({log_count})")).clicked() {
+                *viewing_log_id = Some(entry_id);
+            }
+        });
+
+        for e in &errors {
             ui.colored_label(egui::Color32::LIGHT_RED, e);
-        }
-
-        // "Block guest input" toggle: while on, this client's mouse/
-        // keyboard stop reaching the host (it keeps streaming frames as
-        // normal) - a "view only" mode for when you just want to watch
-        // without risking an accidental click or keystroke landing on
-        // the host.
-        let (label, pending, blocked) = {
-            let status = session.guest_input.lock().unwrap();
-            let label = if status.pending {
-                "Block guest input: ..."
-            } else if status.blocked {
-                "Block guest input: On"
-            } else {
-                "Block guest input: Off"
-            };
-            (label, status.pending, status.blocked)
-        };
-        if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
-            session.guest_input.lock().unwrap().pending = true;
-            let _ = write_message(
-                &mut session.stream,
-                &ClientMessage::BlockGuestInput { blocked: !blocked },
-            );
-        }
-
-        // "Get keyboard keystrokes" toggle: while on, the host forwards
-        // its own physical keystrokes here, persisted to disk and kept
-        // for 1 day. Host-side support is Windows-only, same caveat as
-        // blank screen. The log itself lives in a separate window (see
-        // "View Logs" below) rather than inline here, so it doesn't push
-        // the remote view around.
-        let (label, pending, enabled, err) = {
-            let status = session.keystroke_log.lock().unwrap();
-            let label = if status.pending {
-                "Get keyboard keystrokes: ..."
-            } else if status.enabled {
-                "Get keyboard keystrokes: On"
-            } else {
-                "Get keyboard keystrokes: Off"
-            };
-            (label, status.pending, status.enabled, status.error.clone())
-        };
-        if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
-            session.keystroke_log.lock().unwrap().pending = true;
-            let _ = write_message(
-                &mut session.stream,
-                &ClientMessage::ToggleKeystrokeLog { enabled: !enabled },
-            );
-        }
-        if let Some(e) = err {
-            ui.colored_label(egui::Color32::LIGHT_RED, e);
-        }
-
-        let log_count = keystroke_log
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| e.host == session.host_key)
-            .count();
-        if ui.button(format!("View Logs ({log_count})")).clicked() {
-            *viewing_log_id = Some(entry_id);
         }
 
         ui.add_space(4.0);
@@ -1198,6 +1301,18 @@ fn spawn_connect(
                     pending: false,
                     error: None,
                 }));
+                let clipboard_status = Arc::new(Mutex::new(ClipboardSyncStatus {
+                    enabled: false,
+                    pending: false,
+                    error: None,
+                }));
+                let clipboard_outgoing: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                // Not a `Session` field - only the poller (below) and the
+                // receiver thread (applying incoming updates) need it, to
+                // keep each other from re-detecting/echoing the other's
+                // change back. See `SessionHandles::clipboard_last_known`.
+                let clipboard_last_known: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                let lock_host_status = Arc::new(Mutex::new(LockHostStatus { pending: false, error: None }));
                 let running = Arc::new(AtomicBool::new(true));
                 let receiver = spawn_frame_receiver(
                     &stream,
@@ -1208,7 +1323,16 @@ fn spawn_connect(
                         keystroke_status: keystroke_status.clone(),
                         keystroke_log,
                         host_key: host_key.clone(),
+                        clipboard_sync: clipboard_status.clone(),
+                        clipboard_last_known: clipboard_last_known.clone(),
+                        lock_host: lock_host_status.clone(),
                     },
+                    running.clone(),
+                );
+                let clipboard_poll = spawn_clipboard_poller(
+                    clipboard_status.clone(),
+                    clipboard_outgoing.clone(),
+                    clipboard_last_known,
                     running.clone(),
                 );
                 Session {
@@ -1219,9 +1343,13 @@ fn spawn_connect(
                     blank_screen,
                     guest_input,
                     keystroke_log: keystroke_status,
+                    clipboard_sync: clipboard_status,
+                    clipboard_outgoing,
+                    lock_host: lock_host_status,
                     host_key,
                     running,
                     receiver: Some(receiver),
+                    clipboard_poll: Some(clipboard_poll),
                     texture: None,
                     uploaded_version: 0,
                     last_mouse: None,
@@ -1249,6 +1377,11 @@ struct SessionHandles {
     /// `host_key` when read, same as everywhere else this log is used.
     keystroke_log: Arc<Mutex<Vec<KeystrokeEntry>>>,
     host_key: String,
+    clipboard_sync: Arc<Mutex<ClipboardSyncStatus>>,
+    /// Shared with `spawn_clipboard_poller` - see that fn's comment and
+    /// `spawn_connect`'s local of the same name for why.
+    clipboard_last_known: Arc<Mutex<Option<String>>>,
+    lock_host: Arc<Mutex<LockHostStatus>>,
 }
 
 fn spawn_frame_receiver(
@@ -1256,8 +1389,17 @@ fn spawn_frame_receiver(
     handles: SessionHandles,
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    let SessionHandles { shared, blank_screen, guest_input, keystroke_status, keystroke_log, host_key } =
-        handles;
+    let SessionHandles {
+        shared,
+        blank_screen,
+        guest_input,
+        keystroke_status,
+        keystroke_log,
+        host_key,
+        clipboard_sync,
+        clipboard_last_known,
+        lock_host,
+    } = handles;
     let mut reader_stream = stream.try_clone().expect("clone socket");
     let version_counter = Arc::new(AtomicU64::new(0));
     std::thread::spawn(move || {
@@ -1297,6 +1439,29 @@ fn spawn_frame_receiver(
                     log.push(KeystrokeEntry { timestamp_ms, host: host_key.clone(), key });
                     save_keystrokes(&log);
                 }
+                Ok(HostMessage::ClipboardSyncResult { enabled, ok, reason }) => {
+                    let mut status = clipboard_sync.lock().unwrap();
+                    status.pending = false;
+                    status.enabled = enabled;
+                    status.error = if ok { None } else { reason };
+                }
+                Ok(HostMessage::ClipboardUpdate { text }) => {
+                    if clipboard_sync.lock().unwrap().enabled {
+                        // Mark it known *before* applying it locally, so
+                        // the poll thread's next tick sees its own read
+                        // already matches and doesn't echo it straight
+                        // back to the host.
+                        *clipboard_last_known.lock().unwrap() = Some(text.clone());
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(text);
+                        }
+                    }
+                }
+                Ok(HostMessage::LockHostResult { ok, reason }) => {
+                    let mut status = lock_host.lock().unwrap();
+                    status.pending = false;
+                    status.error = if ok { None } else { reason };
+                }
                 Ok(HostMessage::Error { message }) => {
                     eprintln!("Host error: {message}");
                 }
@@ -1305,6 +1470,49 @@ fn spawn_frame_receiver(
             }
         }
         running.store(false, Ordering::Relaxed);
+    })
+}
+
+/// Polls this client's OS clipboard while `clipboard_sync.enabled` is set,
+/// handing each newly-detected value off via `outgoing` for the UI thread
+/// to actually send (see `Session::clipboard_outgoing` and
+/// `show_connected`, which drains it). A single thread runs for the whole
+/// life of the session regardless of the toggle's state - flipping the
+/// toggle just changes whether this loop's tick does anything, rather than
+/// starting/stopping a thread each time (there's no OS resource being
+/// held here the way `blank_screen`'s overlay window or the host's
+/// keyboard hook are, so there's nothing to actually tear down between
+/// toggles).
+///
+/// `last_known` is shared with the receiver thread applying incoming
+/// updates (see `spawn_frame_receiver`'s `ClipboardUpdate` handling) so
+/// this poller doesn't immediately re-detect a remote update just applied
+/// to this machine's clipboard and echo it straight back to the host.
+fn spawn_clipboard_poller(
+    clipboard_sync: Arc<Mutex<ClipboardSyncStatus>>,
+    outgoing: Arc<Mutex<Option<String>>>,
+    last_known: Arc<Mutex<Option<String>>>,
+    running: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            if clipboard_sync.lock().unwrap().enabled {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    // Errors here just mean "nothing text-shaped to sync
+                    // this tick" (empty clipboard, or a non-text format
+                    // like an image) - not a real failure.
+                    if let Ok(text) = clipboard.get_text() {
+                        let mut last = last_known.lock().unwrap();
+                        if last.as_deref() != Some(text.as_str()) {
+                            *last = Some(text.clone());
+                            drop(last);
+                            *outgoing.lock().unwrap() = Some(text);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
     })
 }
 

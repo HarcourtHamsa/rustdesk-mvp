@@ -59,6 +59,26 @@ pub enum ClientMessage {
     /// messages above (those are keys the client sends *to* the host).
     /// Windows-only on the host side, same as `ToggleBlankScreen`.
     ToggleKeystrokeLog { enabled: bool },
+    /// Toggle clipboard sharing: while on, whichever side's clipboard
+    /// changes gets forwarded to the other side as a `ClipboardUpdate`
+    /// (below, and the one on `HostMessage`) and applied to that side's
+    /// OS clipboard. Cross-platform on the host side (unlike the other
+    /// toggles above), but can still fail - no display server, a locked
+    /// session, etc.
+    ToggleClipboardSync { enabled: bool },
+    /// This client's clipboard just changed while sync is on - the text
+    /// to mirror onto the host's clipboard. Ignored by the host if sync
+    /// isn't currently enabled (e.g. a stale message that crossed with a
+    /// disable).
+    ClipboardUpdate { text: String },
+    /// One-shot: lock the host machine's desktop session, the same effect
+    /// as physically pressing Win+L there. Unlike everything above, this
+    /// isn't a toggle - it's a single action with no ongoing state to
+    /// report back, just whether it worked (see `HostMessage::
+    /// LockHostResult`). Meant for e.g. locking your own machine back up
+    /// once you're done working on it remotely, without needing to be
+    /// standing in front of it. Windows-only on the host side.
+    LockHost,
     Disconnect,
 }
 
@@ -112,6 +132,28 @@ pub enum HostMessage {
     Keystroke {
         key: String,
         timestamp_ms: u64,
+    },
+    /// Reply to `ClientMessage::ToggleClipboardSync`, confirming the new
+    /// state - same shape as `KeystrokeLogResult` (this can fail too: no
+    /// display server, a locked session, etc.).
+    ClipboardSyncResult {
+        enabled: bool,
+        ok: bool,
+        reason: Option<String>,
+    },
+    /// The host's clipboard just changed while sync is on - the text to
+    /// mirror onto this client's clipboard. Ignored by the client if sync
+    /// isn't currently enabled on its end (same stale-message caveat as
+    /// `ClientMessage::ClipboardUpdate`).
+    ClipboardUpdate {
+        text: String,
+    },
+    /// Reply to `ClientMessage::LockHost`, confirming whether it worked -
+    /// no `enabled` field (unlike the toggles' results) since locking is
+    /// a one-shot action with no ongoing state to report.
+    LockHostResult {
+        ok: bool,
+        reason: Option<String>,
     },
 }
 
