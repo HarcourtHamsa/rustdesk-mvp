@@ -9,8 +9,20 @@
 //! password hash. Do not expose this port directly to the open internet -
 //! tunnel it over SSH or a VPN. See the top-level README.
 
-mod gui;
+// Suppresses the console window that would otherwise pop up when
+// double-clicking the exe (the default, tray-only mode has no use for
+// one). Only in release builds, so `eprintln!` diagnostics stay visible
+// while developing. CLI modes (`listen`/`relay`/`with-relay`) invoked from
+// an existing terminal are unaffected either way - they inherit that
+// terminal's console rather than needing one auto-created.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod blank_screen;
+mod gui;
+mod gui_core;
+mod tray;
+
+use blank_screen::BlankScreenOverlay;
 use enigo::{Enigo, Key as EnigoKey, KeyboardControllable, MouseButton as EnigoMouseButton, MouseControllable};
 use rd_protocol::{
     hash_password, hashes_match, read_message, write_message, ClientMessage, HostMessage,
@@ -35,8 +47,15 @@ fn generate_random_password() -> String {
 fn print_help() {
     println!("rd-host [mode] [options]");
     println!();
-    println!("With no arguments, opens a small GUI: click the power button to start");
-    println!("hosting on the default port, then copy the address and password it shows.");
+    println!("With no arguments, starts hosting immediately and sits in the system");
+    println!("tray - no window. Right-click the tray icon to copy the address/");
+    println!("password, open the connection log, or quit. The address and password");
+    println!("are also appended to rd-host-connections.log next to the executable");
+    println!("once the ngrok tunnel finishes starting (or gives up).");
+    println!();
+    println!("  --window");
+    println!("      Show the old visible window instead (a Start/Stop button you");
+    println!("      click yourself, with the address/password shown right there).");
     println!();
     println!("Modes (for scripted/headless use, e.g. running rd-relay on a VPS):");
     println!("  listen [--port <port>] [--password <password>]");
@@ -63,6 +82,12 @@ fn main() {
     let mode = args.next().unwrap_or_default();
     match mode.as_str() {
         "" => {
+            if let Err(e) = tray::run() {
+                eprintln!("Failed to start: {e}");
+                std::process::exit(1);
+            }
+        }
+        "--window" => {
             if let Err(e) = gui::run() {
                 eprintln!("Failed to open GUI: {e}");
                 std::process::exit(1);
@@ -354,8 +379,20 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
         return Ok(());
     }
 
+    // Every write from here on goes through this one shared, locked clone -
+    // `stream` itself is used for reading only from this point on. Before
+    // this, `stream` was also used directly for a couple of ad-hoc replies
+    // (RequestScreenInfo, and now ToggleBlankScreen) *while* the frame
+    // sender thread wrote to its own separate clone concurrently -  two
+    // unsynchronized writers to the same socket, which can interleave
+    // partial messages (a length prefix from one write landing between
+    // another write's length prefix and payload) and corrupt the framing.
+    // Routing every writer through the same Mutex makes each `write_message`
+    // call atomic with respect to all the others.
+    let writer: Arc<Mutex<TcpStream>> = Arc::new(Mutex::new(stream.try_clone()?));
+
     write_message(
-        &mut stream,
+        &mut *writer.lock().unwrap(),
         &HostMessage::AuthResult {
             ok: true,
             reason: None,
@@ -435,14 +472,15 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
         }
     });
 
-    let mut writer_stream = stream.try_clone()?;
+    let writer_for_sender = writer.clone();
     let running_sender = running.clone();
     let sender_thread = std::thread::spawn(move || {
         while running_sender.load(Ordering::Relaxed) {
             let frame = latest_frame.lock().unwrap().take();
             match frame {
                 Some(msg) => {
-                    if write_message(&mut writer_stream, &msg).is_err() {
+                    let wrote = write_message(&mut *writer_for_sender.lock().unwrap(), &msg);
+                    if wrote.is_err() {
                         running_sender.store(false, Ordering::Relaxed);
                         break; // client disconnected
                     }
@@ -454,6 +492,11 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
 
     // --- Input receive loop (runs on this thread) ---
     let mut enigo = Enigo::new();
+    // Dropped whenever this function returns, by any path (clean
+    // disconnect, read error, early return) - which tears the overlay
+    // down via its Drop impl. A dead session must never leave the host's
+    // screen permanently blanked.
+    let mut blank_screen = BlankScreenOverlay::new();
     loop {
         let msg: Result<ClientMessage, _> = read_message(&mut stream);
         let msg = match msg {
@@ -491,7 +534,24 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                     screen_width: screen_w,
                     screen_height: screen_h,
                 };
-                let _ = write_message(&mut stream, &msg);
+                let _ = write_message(&mut *writer.lock().unwrap(), &msg);
+            }
+            ClientMessage::ToggleBlankScreen { enabled } => {
+                let (ok, reason) = if enabled {
+                    match blank_screen.enable() {
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(e)),
+                    }
+                } else {
+                    blank_screen.disable();
+                    (true, None)
+                };
+                let msg = HostMessage::BlankScreenResult {
+                    enabled: blank_screen.is_enabled(),
+                    ok,
+                    reason,
+                };
+                let _ = write_message(&mut *writer.lock().unwrap(), &msg);
             }
             ClientMessage::Disconnect => break,
             ClientMessage::Auth { .. } => {} // ignore repeated auth

@@ -4,7 +4,10 @@ A minimal, self-hosted remote-desktop tool in Rust. No third-party service,
 no account, no cloud — three small binaries you run yourself.
 
 - **`rd-host`** — runs on the machine you want to control (your laptop at home).
-  Streams the screen and injects mouse/keyboard input it receives.
+  Streams the screen and injects mouse/keyboard input it receives. Double-click
+  it and it just starts hosting immediately — no window, just a system tray
+  icon (right-click it for the address/password, or `--window` if you want
+  the old visible Start/Stop window instead). See "Running rd-host" below.
 - **`rd-client`** — runs on the machine you have with you. A small GUI app:
   enter an address and password and click Connect. Shows you the remote
   screen and forwards your mouse/keyboard to it.
@@ -155,6 +158,38 @@ Things to know about this path:
   if the tunnel drops after a few hours, just restart `ngrok tcp 5900` and
   give the new address to whoever's connecting.
 
+## Running rd-host
+
+Double-click `rd-host.exe` (or run it with no arguments) and it starts
+hosting immediately — binds the port, generates a password, and launches
+an ngrok tunnel automatically if `ngrok` is installed. **No window opens
+at all** — just a small icon in the system tray (it may land in the
+hidden/overflow tray icons the first time, which is normal Windows
+behavior for any new tray icon; drag it out if you want it always
+visible). Right-click it for:
+- **Copy Address** — the tunnel address once ready, or the LAN address
+  meanwhile/if ngrok isn't available.
+- **Copy Password**
+- **Open Log File** — see below.
+- **Quit** — stops hosting and the tunnel cleanly.
+
+Double-clicking the icon shows a quick status popup (addresses + password)
+without needing the full window.
+
+Once the tunnel finishes starting (or gives up), the address and password
+are also appended to **`rd-host-connections.log`**, next to the exe, so
+they're not lost just because there's no window showing them:
+```
+[2026-08-21 09:24:12] rd-host is running
+  LAN address: 192.168.100.3:5900
+  Tunnel:      7.tcp.eu.ngrok.io:24527
+  Password:    ujtL6oP4X6
+```
+
+If you want the old interactive window instead (a Start/Stop button you
+click yourself), run `rd-host --window`. CLI modes (`listen`/`relay`/
+`with-relay`, for scripted or headless use e.g. on a VPS) are unchanged.
+
 ## Getting your kid to install it on your laptop
 
 1. Get the source to them (USB drive, email, cloud link — whatever's fastest).
@@ -164,19 +199,13 @@ Things to know about this path:
    ```
    cargo build --release -p rd-host
    ```
-4. Have them run the host binary:
-   ```
-   ./target/release/rd-host listen
-   ```
-   It prints a **port** and a random **password** — have them read both to
-   you over the phone, along with this machine's IP address (see
-   "Connecting" below for what you then type into `rd-client`).
-
-   If they're not on your home network (or you haven't port-forwarded),
-   have them also run `ngrok tcp <port>` in a second terminal and read you
-   the `Forwarding` address instead of the IP — see the ngrok section
-   above. That's the "just get me in from anywhere" option until the
-   relay/code flow is reachable from the client GUI.
+4. Have them double-click `target/release/rd-host.exe` (or run it with no
+   arguments) — it starts hosting on its own, no further action needed on
+   their end. Have them right-click the new tray icon, choose **Open Log
+   File**, and read you the address and password over the phone (see
+   "Connecting" below for what you then type into `rd-client`). If ngrok
+   is installed on their machine, the logged address already works from
+   anywhere — no port forwarding needed.
 
 If a full Rust install is too slow for the emergency, it's worth having
 your kid enable your OS's built-in remote desktop (Windows Remote Desktop /
@@ -205,6 +234,28 @@ Password: aB3xQ9kLp2
 Once connected, the remote screen fills the main pane; move your mouse and
 type inside it to control the remote machine. Click **Disconnect**, or
 close the window, to end the session.
+
+### Blank host screen (privacy screen)
+
+Next to Disconnect there's a **Blank host screen** toggle. Turning it on
+shows a full-screen "Welcome to Onboarding" message on the *host's own
+physical monitor*, with the real mouse cursor hidden too — useful for
+setting up someone's machine remotely without anyone nearby seeing what's
+on screen or watching the cursor move on its own. You (the client) keep
+seeing and controlling the real desktop the whole time; only the host's
+local screen is covered.
+
+This works via a Windows API
+([`SetWindowDisplayAffinity`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity)
+with `WDA_EXCLUDEFROMCAPTURE`) that excludes a window from screen capture
+entirely, so `rd-host`'s own capture keeps seeing the real desktop
+underneath, plus a temporary swap of the system cursor for a blank one
+(the cursor is a separate compositor layer, unaffected by the window
+exclusion above, so it needs its own fix). Needs **Windows 10 version 2004
+or later** on the host; on older Windows or on macOS/Linux the toggle will
+show an error instead of silently doing nothing. Turning the host off, or
+the connection dropping for any reason, always clears the overlay and
+restores the real cursor — neither can be left stuck.
 
 ## Security — read this
 
@@ -261,6 +312,9 @@ relay/      rendezvous server (code <-> host matching, then a blind byte pipe).
   relay`/`with-relay` aren't reachable end-to-end from it right now — see
   the note near the top of this README.
 - One client at a time per host, in either mode.
+- Blank host screen is Windows-only (needs version 2004+) — the toggle
+  reports an error on older Windows, macOS, and Linux rather than doing
+  anything.
 - Windows/macOS input-injection permissions: macOS will need you to grant
   the terminal (or the built binary) **Accessibility** and **Screen
   Recording** permissions in System Settings the first time you run

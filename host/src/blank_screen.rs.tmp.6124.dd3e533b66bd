@@ -1,0 +1,306 @@
+//! The "blank host screen" privacy feature: while toggled on, anyone
+//! physically at the host machine sees a full-screen "Welcome to
+//! Onboarding" message instead of the real desktop, while the connected
+//! client keeps seeing and controlling the real thing.
+//!
+//! This works by creating a topmost, fullscreen local window and marking
+//! it with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` - a Windows
+//! API (10, version 2004+) that excludes a specific window from anything
+//! that captures the screen, including the DXGI Desktop Duplication API
+//! our own `scrap`-based capture thread uses. So our capture keeps seeing
+//! the real desktop underneath, while a person looking at the physical
+//! monitor sees this window on top of it.
+//!
+//! Windows-only: there's no equivalent capture-exclusion mechanism wired
+//! up for macOS/Linux here, so `enable()` just reports it's unsupported
+//! on other platforms.
+
+#[cfg(windows)]
+mod imp {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
+    use winapi::shared::windef::{HBRUSH, HWND};
+    use winapi::shared::winerror::ERROR_CLASS_ALREADY_EXISTS;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::libloaderapi::GetModuleHandleW;
+    use winapi::um::wingdi::{
+        CreateFontW, DeleteObject, GetStockObject, SelectObject, SetBkMode, SetTextColor, RGB,
+        BLACK_BRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+        FF_SWISS, FW_SEMIBOLD, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    };
+    use winapi::um::winuser::{
+        BeginPaint, DefWindowProcW, DispatchMessageW, DrawTextW, EndPaint, GetClientRect,
+        GetMessageW, GetSystemMetrics, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+        SetCursor, ShowWindow, TranslateMessage, UpdateWindow, CW_USEDEFAULT, DT_CENTER,
+        DT_SINGLELINE, DT_VCENTER, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_CLOSE,
+        WM_DESTROY, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    };
+    use winapi::um::winuser::{CreateWindowExW, SetWindowDisplayAffinity};
+
+    /// Added in Windows 10 2004 (SDK 10.0.19041) - not yet in winapi 0.3.9's
+    /// constant list, though the function that takes it is. Just a number.
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x00000011;
+
+    const MESSAGE: &str = "Welcome to Onboarding";
+
+    fn wide(s: &str) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        msg: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_PAINT => {
+                let mut ps: winapi::um::winuser::PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rect);
+                winapi::um::winuser::FillRect(hdc, &rect, GetStockObject(BLACK_BRUSH as i32) as HBRUSH);
+
+                let font_name = wide("Segoe UI");
+                let font = CreateFontW(
+                    -36,
+                    0,
+                    0,
+                    0,
+                    FW_SEMIBOLD as i32,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET as u32,
+                    OUT_DEFAULT_PRECIS as u32,
+                    CLIP_DEFAULT_PRECIS as u32,
+                    CLEARTYPE_QUALITY as u32,
+                    (DEFAULT_PITCH | FF_SWISS) as u32,
+                    font_name.as_ptr(),
+                );
+                let old_font = SelectObject(hdc, font as _);
+                SetBkMode(hdc, TRANSPARENT as i32);
+                SetTextColor(hdc, RGB(255, 255, 255));
+
+                let text = wide(MESSAGE);
+                DrawTextW(
+                    hdc,
+                    text.as_ptr(),
+                    -1,
+                    &mut rect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                SelectObject(hdc, old_font);
+                DeleteObject(font as _);
+                EndPaint(hwnd, &ps);
+                0
+            }
+            WM_SETCURSOR => {
+                // The remote client is still moving the real cursor via
+                // injected input (that's the whole point - it keeps
+                // controlling the real desktop underneath). Without this,
+                // that moving cursor is the one visible giveaway on an
+                // otherwise blanked screen. Our window covers the entire
+                // screen and is topmost, so the cursor is always over it;
+                // setting it to nothing here hides it completely.
+                SetCursor(std::ptr::null_mut());
+                1
+            }
+            WM_CLOSE => {
+                winapi::um::winuser::DestroyWindow(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    fn create_overlay_window() -> Result<HWND, String> {
+        unsafe {
+            let hinstance = GetModuleHandleW(std::ptr::null());
+            let class_name = wide("RdHostBlankOverlay");
+
+            let wc = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(window_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinstance,
+                hIcon: std::ptr::null_mut(),
+                hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+            // Re-enabling after a previous disable re-registers the same
+            // class - that's expected and harmless, ignore just that error.
+            if RegisterClassW(&wc) == 0 {
+                let err = GetLastError();
+                if err != ERROR_CLASS_ALREADY_EXISTS {
+                    return Err(format!("RegisterClassW failed (error {err})"));
+                }
+            }
+
+            let w = GetSystemMetrics(SM_CXSCREEN);
+            let h = GetSystemMetrics(SM_CYSCREEN);
+
+            let title = wide("rd-host blank screen");
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                w,
+                h,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                hinstance,
+                std::ptr::null_mut(),
+            );
+            if hwnd.is_null() {
+                return Err(format!("CreateWindowExW failed (error {})", GetLastError()));
+            }
+            eprintln!("[blank_screen] created overlay window {:?} ({}x{})", hwnd, w, h);
+
+            if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == 0 {
+                let err = GetLastError();
+                winapi::um::winuser::DestroyWindow(hwnd);
+                return Err(format!(
+                    "SetWindowDisplayAffinity failed (error {err}) - this needs Windows 10 version 2004 or later"
+                ));
+            }
+            eprintln!("[blank_screen] SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) ok");
+
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+            let _ = CW_USEDEFAULT; // (unused constant kept only for readers scanning imports)
+            Ok(hwnd)
+        }
+    }
+
+    fn run_message_loop() {
+        eprintln!("[blank_screen] message loop starting");
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            loop {
+                let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                if ret <= 0 {
+                    eprintln!("[blank_screen] GetMessageW returned {ret}, exiting loop");
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    /// Owns the overlay's dedicated window-and-message-loop thread. Dropping
+    /// this (or calling `disable`) tears the overlay down.
+    pub struct BlankScreenOverlay {
+        hwnd: Arc<AtomicIsize>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl BlankScreenOverlay {
+        pub fn new() -> Self {
+            Self { hwnd: Arc::new(AtomicIsize::new(0)), thread: None }
+        }
+
+        pub fn is_enabled(&self) -> bool {
+            self.thread.is_some()
+        }
+
+        /// Turn the overlay on. A no-op if it's already on.
+        pub fn enable(&mut self) -> Result<(), String> {
+            if self.thread.is_some() {
+                return Ok(());
+            }
+
+            let hwnd_slot = self.hwnd.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
+            let handle = std::thread::spawn(move || match create_overlay_window() {
+                Ok(hwnd) => {
+                    hwnd_slot.store(hwnd as isize, Ordering::SeqCst);
+                    let _ = ready_tx.send(Ok(()));
+                    run_message_loop();
+                    hwnd_slot.store(0, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            });
+
+            match ready_rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(Ok(())) => {
+                    self.thread = Some(handle);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    let _ = handle.join();
+                    Err(e)
+                }
+                Err(_) => {
+                    let _ = handle.join();
+                    Err("timed out creating the blank-screen overlay window".to_string())
+                }
+            }
+        }
+
+        /// Turn the overlay off. A no-op if it's already off.
+        pub fn disable(&mut self) {
+            let hwnd = self.hwnd.load(Ordering::SeqCst);
+            if hwnd != 0 {
+                unsafe {
+                    PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
+                }
+            }
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    impl Drop for BlankScreenOverlay {
+        fn drop(&mut self) {
+            // A dropped session (disconnect, error, force-close on power-off)
+            // must never leave the host's screen permanently blanked.
+            self.disable();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod imp {
+    /// Non-Windows stub: there's no capture-exclusion mechanism wired up
+    /// here for macOS/Linux, so this always reports itself as off and
+    /// fails clearly rather than silently doing nothing.
+    pub struct BlankScreenOverlay;
+
+    impl BlankScreenOverlay {
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn is_enabled(&self) -> bool {
+            false
+        }
+        pub fn enable(&mut self) -> Result<(), String> {
+            Err("blank host screen isn't supported on this platform yet (Windows-only)".to_string())
+        }
+        pub fn disable(&mut self) {}
+    }
+}
+
+pub use imp::BlankScreenOverlay;

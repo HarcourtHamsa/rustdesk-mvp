@@ -38,6 +38,11 @@ pub enum ClientMessage {
     Key { key: String, pressed: bool },
     /// Client is asking the host to resend the current screen size (e.g. after a resize).
     RequestScreenInfo,
+    /// Toggle the "blank host screen" privacy overlay: while on, anyone
+    /// physically at the host machine sees a "Welcome to Onboarding"
+    /// screen instead of the real desktop, while this client keeps seeing
+    /// and controlling the real thing. Windows-only on the host side.
+    ToggleBlankScreen { enabled: bool },
     Disconnect,
 }
 
@@ -58,6 +63,14 @@ pub enum HostMessage {
     },
     Error {
         message: String,
+    },
+    /// Reply to `ClientMessage::ToggleBlankScreen`, so the client's toggle
+    /// reflects what actually happened (e.g. unsupported Windows version)
+    /// rather than just assuming the request succeeded.
+    BlankScreenResult {
+        enabled: bool,
+        ok: bool,
+        reason: Option<String>,
     },
 }
 

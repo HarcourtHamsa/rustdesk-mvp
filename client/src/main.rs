@@ -37,6 +37,18 @@ struct SharedFrame {
     version: u64,
 }
 
+/// State of the host-side "blank host screen" privacy toggle, updated by
+/// the receiver thread whenever a `BlankScreenResult` arrives, read by the
+/// UI thread to draw the toggle button.
+struct BlankScreenStatus {
+    enabled: bool,
+    /// True from the moment we send a toggle request until the host's
+    /// reply arrives - the button disables itself meanwhile so a slow
+    /// reply can't be raced by a second click.
+    pending: bool,
+    error: Option<String>,
+}
+
 /// Everything that exists only while connected: the socket, the frame feed,
 /// and the background thread reading it.
 struct Session {
@@ -44,6 +56,7 @@ struct Session {
     remote_w: usize,
     remote_h: usize,
     shared: Arc<Mutex<SharedFrame>>,
+    blank_screen: Arc<Mutex<BlankScreenStatus>>,
     running: Arc<AtomicBool>,
     receiver: Option<std::thread::JoinHandle<()>>,
     texture: Option<egui::TextureHandle>,
@@ -258,6 +271,36 @@ fn show_connected(ui: &mut egui::Ui, ctx: &egui::Context, session: &mut Session)
         }
     });
 
+    // "Blank host screen" toggle: hides the real desktop from anyone
+    // physically at the host machine (shows "Welcome to Onboarding"
+    // there instead) while this client keeps seeing/controlling it.
+    // Host-side support is Windows-only; other hosts reply with an error,
+    // shown below rather than the toggle just silently doing nothing.
+    ui.horizontal(|ui| {
+        let (label, pending, enabled, err) = {
+            let status = session.blank_screen.lock().unwrap();
+            let label = if status.pending {
+                "Blank host screen: ..."
+            } else if status.enabled {
+                "Blank host screen: On"
+            } else {
+                "Blank host screen: Off"
+            };
+            (label, status.pending, status.enabled, status.error.clone())
+        };
+
+        if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+            session.blank_screen.lock().unwrap().pending = true;
+            let _ = write_message(
+                &mut session.stream,
+                &ClientMessage::ToggleBlankScreen { enabled: !enabled },
+            );
+        }
+        if let Some(e) = err {
+            ui.colored_label(egui::Color32::LIGHT_RED, e);
+        }
+    });
+
     // Upload the latest decoded frame to a GPU texture, only if it changed.
     let (w, h, version) = {
         let guard = session.shared.lock().unwrap();
@@ -320,25 +363,37 @@ fn handle_input(
         }
     }
 
-    // Mouse buttons.
-    ctx.input(|i| {
-        for (idx, (btn, proto_btn)) in [
-            (egui::PointerButton::Primary, MouseButton::Left),
-            (egui::PointerButton::Secondary, MouseButton::Right),
-            (egui::PointerButton::Middle, MouseButton::Middle),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let down = i.pointer.button_down(btn);
-            if down != session.mouse_down[idx] {
-                session.mouse_down[idx] = down;
-                let _ = write_message(
-                    &mut session.stream,
-                    &ClientMessage::MouseButton { button: proto_btn, pressed: down },
-                );
+    // Mouse buttons. Gated to the remote-view widget specifically - egui's
+    // `i.pointer.button_down()` reflects the raw OS button state regardless
+    // of which widget is involved, so without this check, clicking *any*
+    // other UI element (the Blank host screen toggle, Disconnect, ...)
+    // would also fire a phantom click into the host at whatever stale
+    // position the pointer last was inside the remote view.
+    let over_remote_view =
+        response.hovered() || response.dragged() || response.is_pointer_button_down_on();
+    if over_remote_view {
+        ctx.input(|i| {
+            for (idx, (btn, proto_btn)) in [
+                (egui::PointerButton::Primary, MouseButton::Left),
+                (egui::PointerButton::Secondary, MouseButton::Right),
+                (egui::PointerButton::Middle, MouseButton::Middle),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let down = i.pointer.button_down(btn);
+                if down != session.mouse_down[idx] {
+                    session.mouse_down[idx] = down;
+                    let _ = write_message(
+                        &mut session.stream,
+                        &ClientMessage::MouseButton { button: proto_btn, pressed: down },
+                    );
+                }
             }
-        }
+        });
+    }
+
+    ctx.input(|i| {
 
         // Scroll wheel (only forward while hovering the remote view).
         if response.hovered() && i.smooth_scroll_delta.y.abs() > 0.01 {
@@ -400,13 +455,24 @@ fn spawn_connect(address: String, password: String, tx: mpsc::Sender<ConnectOutc
                     rgb: Vec::new(),
                     version: 0,
                 }));
+                let blank_screen = Arc::new(Mutex::new(BlankScreenStatus {
+                    enabled: false,
+                    pending: false,
+                    error: None,
+                }));
                 let running = Arc::new(AtomicBool::new(true));
-                let receiver = spawn_frame_receiver(&stream, shared.clone(), running.clone());
+                let receiver = spawn_frame_receiver(
+                    &stream,
+                    shared.clone(),
+                    blank_screen.clone(),
+                    running.clone(),
+                );
                 Session {
                     stream,
                     remote_w: w,
                     remote_h: h,
                     shared,
+                    blank_screen,
                     running,
                     receiver: Some(receiver),
                     texture: None,
@@ -427,6 +493,7 @@ fn spawn_connect(address: String, password: String, tx: mpsc::Sender<ConnectOutc
 fn spawn_frame_receiver(
     stream: &TcpStream,
     shared: Arc<Mutex<SharedFrame>>,
+    blank_screen: Arc<Mutex<BlankScreenStatus>>,
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     let mut reader_stream = stream.try_clone().expect("clone socket");
@@ -445,6 +512,12 @@ fn spawn_frame_receiver(
                         guard.rgb = rgb;
                         guard.version = v;
                     }
+                }
+                Ok(HostMessage::BlankScreenResult { enabled, ok, reason }) => {
+                    let mut status = blank_screen.lock().unwrap();
+                    status.pending = false;
+                    status.enabled = enabled;
+                    status.error = if ok { None } else { reason };
                 }
                 Ok(HostMessage::Error { message }) => {
                     eprintln!("Host error: {message}");
