@@ -109,6 +109,16 @@ struct LockHostStatus {
     error: Option<String>,
 }
 
+/// State of the one-shot "refresh" action - same pending/error shape as
+/// `LockHostStatus`. Recreates the host's screen-capture session, for
+/// when the view gets stuck showing a screen the host has since moved
+/// past (see `ClientMessage::RefreshScreen`'s doc comment for why that
+/// happens).
+struct RefreshStatus {
+    pending: bool,
+    error: Option<String>,
+}
+
 /// One logged keystroke, persisted to disk. `host` is the session's
 /// address (stable even if the session gets renamed later) - the log
 /// panel filters the shared, on-disk history down to entries for
@@ -140,6 +150,7 @@ struct Session {
     /// around the socket itself.
     clipboard_outgoing: Arc<Mutex<Option<String>>>,
     lock_host: Arc<Mutex<LockHostStatus>>,
+    refresh: Arc<Mutex<RefreshStatus>>,
     /// This session's address, used to tag/filter keystroke log entries -
     /// kept alongside the connection since `Session` itself doesn't know
     /// about `SessionEntry`'s `address` field.
@@ -982,6 +993,27 @@ fn show_connected(
                 keep_going = false;
             }
 
+            // "Refresh": one-shot action that asks the host to recreate
+            // its screen-capture session. For when the view gets stuck
+            // showing a screen the host has since moved past - a known
+            // limitation of the underlying capture API (DXGI Desktop
+            // Duplication on Windows), which can stop producing new
+            // frames after certain host-side desktop transitions (a
+            // lock/unlock, the blank-screen overlay, a UAC prompt) even
+            // though the real screen has moved on.
+            let (pending, err) = {
+                let status = session.refresh.lock().unwrap();
+                (status.pending, status.error.clone())
+            };
+            let label = if pending { "Refresh: ..." } else { "Refresh" };
+            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+                session.refresh.lock().unwrap().pending = true;
+                let _ = write_message(&mut session.stream, &ClientMessage::RefreshScreen);
+            }
+            if let Some(e) = err {
+                errors.push(format!("Refresh: {e}"));
+            }
+
             // "Blank host screen" toggle: hides the real desktop from
             // anyone physically at the host machine (shows a fake
             // "Working on updates" screen there instead) while this
@@ -1313,6 +1345,7 @@ fn spawn_connect(
                 // change back. See `SessionHandles::clipboard_last_known`.
                 let clipboard_last_known: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
                 let lock_host_status = Arc::new(Mutex::new(LockHostStatus { pending: false, error: None }));
+                let refresh_status = Arc::new(Mutex::new(RefreshStatus { pending: false, error: None }));
                 let running = Arc::new(AtomicBool::new(true));
                 let receiver = spawn_frame_receiver(
                     &stream,
@@ -1326,6 +1359,7 @@ fn spawn_connect(
                         clipboard_sync: clipboard_status.clone(),
                         clipboard_last_known: clipboard_last_known.clone(),
                         lock_host: lock_host_status.clone(),
+                        refresh: refresh_status.clone(),
                     },
                     running.clone(),
                 );
@@ -1346,6 +1380,7 @@ fn spawn_connect(
                     clipboard_sync: clipboard_status,
                     clipboard_outgoing,
                     lock_host: lock_host_status,
+                    refresh: refresh_status,
                     host_key,
                     running,
                     receiver: Some(receiver),
@@ -1382,6 +1417,7 @@ struct SessionHandles {
     /// `spawn_connect`'s local of the same name for why.
     clipboard_last_known: Arc<Mutex<Option<String>>>,
     lock_host: Arc<Mutex<LockHostStatus>>,
+    refresh: Arc<Mutex<RefreshStatus>>,
 }
 
 fn spawn_frame_receiver(
@@ -1399,6 +1435,7 @@ fn spawn_frame_receiver(
         clipboard_sync,
         clipboard_last_known,
         lock_host,
+        refresh,
     } = handles;
     let mut reader_stream = stream.try_clone().expect("clone socket");
     let version_counter = Arc::new(AtomicU64::new(0));
@@ -1459,6 +1496,11 @@ fn spawn_frame_receiver(
                 }
                 Ok(HostMessage::LockHostResult { ok, reason }) => {
                     let mut status = lock_host.lock().unwrap();
+                    status.pending = false;
+                    status.error = if ok { None } else { reason };
+                }
+                Ok(HostMessage::RefreshScreenResult { ok, reason }) => {
+                    let mut status = refresh.lock().unwrap();
                     status.pending = false;
                     status.error = if ok { None } else { reason };
                 }

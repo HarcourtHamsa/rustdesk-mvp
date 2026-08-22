@@ -429,6 +429,15 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
     // one frame's transmit time instead of growing without limit.
     let latest_frame: Arc<Mutex<Option<HostMessage>>> = Arc::new(Mutex::new(None));
 
+    // Lets `ClientMessage::RefreshScreen` ask this thread to recreate its
+    // Capturer: each request carries a reply channel, so the requester
+    // gets a real ok/err back rather than a blind "sure, requested".
+    // Recreating the DXGI Desktop Duplication session is the standard fix
+    // for one that's gotten stuck returning stale/no frames after certain
+    // host-side desktop transitions - see `ClientMessage::RefreshScreen`'s
+    // doc comment.
+    let (refresh_tx, refresh_rx) = mpsc::channel::<mpsc::Sender<Result<(), String>>>();
+
     let running_capture = running.clone();
     let latest_frame_writer = latest_frame.clone();
     let capture_thread = std::thread::spawn(move || {
@@ -446,11 +455,24 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                 return;
             }
         };
-        let (w, h) = (capturer.width(), capturer.height());
+        let (mut w, mut h) = (capturer.width(), capturer.height());
         let target_frame_time = Duration::from_millis(1000 / 12); // ~12 fps
 
         while running_capture.load(Ordering::Relaxed) {
             let frame_start = std::time::Instant::now();
+
+            // A pending refresh request takes priority over this tick's
+            // capture: recreate the Capturer from scratch, same as if the
+            // session had just started.
+            if let Ok(reply_tx) = refresh_rx.try_recv() {
+                let result = Display::primary().and_then(Capturer::new).map(|c| {
+                    w = c.width();
+                    h = c.height();
+                    capturer = c;
+                });
+                let _ = reply_tx.send(result.map_err(|e| e.to_string()));
+            }
+
             match capturer.frame() {
                 Ok(frame) => {
                     if let Some(jpeg) = bgra_to_jpeg(&frame, w, h) {
@@ -675,6 +697,20 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                     Err(e) => (false, Some(e)),
                 };
                 let msg = HostMessage::LockHostResult { ok, reason };
+                let _ = write_message(&mut *writer.lock().unwrap(), &msg);
+            }
+            ClientMessage::RefreshScreen => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                let (ok, reason) = if refresh_tx.send(reply_tx).is_ok() {
+                    match reply_rx.recv_timeout(Duration::from_secs(3)) {
+                        Ok(Ok(())) => (true, None),
+                        Ok(Err(e)) => (false, Some(e)),
+                        Err(_) => (false, Some("timed out refreshing the screen capture".to_string())),
+                    }
+                } else {
+                    (false, Some("capture thread isn't running".to_string()))
+                };
+                let msg = HostMessage::RefreshScreenResult { ok, reason };
                 let _ = write_message(&mut *writer.lock().unwrap(), &msg);
             }
             ClientMessage::Disconnect => break,

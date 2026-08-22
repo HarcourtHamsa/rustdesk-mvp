@@ -79,6 +79,16 @@ pub enum ClientMessage {
     /// once you're done working on it remotely, without needing to be
     /// standing in front of it. Windows-only on the host side.
     LockHost,
+    /// One-shot: ask the host to recreate its screen-capture session and
+    /// resume sending fresh frames. Useful when the client's view gets
+    /// stuck showing a screen the host has since moved past - a known
+    /// limitation of the capture API (DXGI Desktop Duplication on
+    /// Windows), which can stop producing new frames after certain
+    /// host-side desktop transitions (the screen being locked/unlocked,
+    /// the blank-screen overlay switching in/out, a UAC prompt) even
+    /// though the real screen has moved on. Not a toggle, same as
+    /// `LockHost` - see `HostMessage::RefreshScreenResult`.
+    RefreshScreen,
     Disconnect,
 }
 
@@ -152,6 +162,12 @@ pub enum HostMessage {
     /// no `enabled` field (unlike the toggles' results) since locking is
     /// a one-shot action with no ongoing state to report.
     LockHostResult {
+        ok: bool,
+        reason: Option<String>,
+    },
+    /// Reply to `ClientMessage::RefreshScreen`, confirming whether
+    /// recreating the capture session worked.
+    RefreshScreenResult {
         ok: bool,
         reason: Option<String>,
     },
