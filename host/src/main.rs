@@ -83,6 +83,21 @@ fn print_help() {
 }
 
 fn main() {
+    // Make the whole process DPI-aware before anything captures the screen.
+    // On a display with scaling (e.g. 125%/150%), a DPI-unaware process sees
+    // the virtualized *logical* resolution (e.g. 1280x720) while the capture
+    // API hands back the *physical* frame buffer (e.g. 1920x1080). That
+    // width/height mismatch makes `bgra_to_jpeg` read only the top-left
+    // corner, so the client shows a cropped, zoomed-in view instead of the
+    // whole screen. Setting this here - before any mode creates a Capturer -
+    // makes the reported dimensions and the frame buffer agree on physical
+    // pixels. (blank_screen.rs also set it, but only late and only when the
+    // blank overlay was used; this covers every mode from the start.)
+    #[cfg(windows)]
+    unsafe {
+        winapi::um::winuser::SetProcessDPIAware();
+    }
+
     // Load NGROK_AUTHTOKEN (and anything else) from a .env file, if present.
     // Missing file is fine - the token can also come from the real
     // environment, and LAN hosting works without it either way.
