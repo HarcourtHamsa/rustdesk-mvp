@@ -83,6 +83,12 @@ fn print_help() {
 }
 
 fn main() {
+    // Load NGROK_AUTHTOKEN (and anything else) from a .env file next to the
+    // executable or in a parent directory, if present. Missing file is fine -
+    // the token can also come from the real environment, and LAN hosting
+    // works without it either way.
+    let _ = dotenvy::dotenv();
+
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
     match mode.as_str() {

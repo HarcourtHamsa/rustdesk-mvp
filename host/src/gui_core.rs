@@ -4,13 +4,13 @@
 //! sockets or ngrok directly - they both just call `start_hosting()` here
 //! and render/react to the result.
 
+use ngrok::prelude::*;
 use rd_protocol::{hash_password, DEFAULT_PORT};
-use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use url::Url;
 
 /// Live status of the accept loop, shared with whichever UI so it can show
 /// "waiting" vs "connected: <peer>" without polling the socket itself.
@@ -38,7 +38,7 @@ pub fn load_logo_rgba(size: u32) -> Option<Vec<u8>> {
     Some(resized.into_raw())
 }
 
-/// How the ngrok tunnel is coming along, polled from its local API.
+/// How the in-process ngrok tunnel is coming along.
 pub enum NgrokState {
     Starting,
     Ready(String),
@@ -55,9 +55,6 @@ pub struct HostControl {
     pub active_stream: Arc<Mutex<Option<TcpStream>>>,
     pub status: Arc<Mutex<Status>>,
     pub ngrok: Arc<Mutex<NgrokState>>,
-    /// The running `ngrok` child process, if it started successfully - kept
-    /// so powering off can kill it instead of leaving it running orphaned.
-    pub ngrok_child: Arc<Mutex<Option<Child>>>,
 }
 
 /// Start listening on the default port with a fresh random password, and
@@ -78,9 +75,8 @@ pub fn start_hosting() -> std::io::Result<(String, String, HostControl)> {
     let active_stream: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
     let status = Arc::new(Mutex::new(Status::default()));
     let ngrok = Arc::new(Mutex::new(NgrokState::Starting));
-    let ngrok_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
-    spawn_ngrok(DEFAULT_PORT, ngrok.clone(), ngrok_child.clone(), running.clone());
+    spawn_ngrok(DEFAULT_PORT, ngrok.clone(), running.clone());
 
     let running_t = running.clone();
     let active_stream_t = active_stream.clone();
@@ -125,95 +121,94 @@ pub fn start_hosting() -> std::io::Result<(String, String, HostControl)> {
     Ok((
         address,
         password,
-        HostControl { running, active_stream, status, ngrok, ngrok_child },
+        HostControl { running, active_stream, status, ngrok },
     ))
 }
 
 /// Stop accepting new connections, forcibly end whatever session is
-/// currently in progress, and kill the ngrok tunnel - so "off" is an
+/// currently in progress, and tear down the ngrok tunnel - so "off" is an
 /// immediate, complete stop rather than something that trails off in the
-/// background.
+/// background. Flipping `running` to false is what signals the tunnel
+/// thread to drop its forwarder and close the tunnel.
 pub fn stop_hosting(control: &HostControl) {
     control.running.store(false, Ordering::Relaxed);
     if let Some(stream) = control.active_stream.lock().unwrap().take() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
-    if let Some(mut child) = control.ngrok_child.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
-/// Launch `ngrok tcp <port>` and poll its local API (the same one the
-/// `ngrok` CLI itself uses to report the tunnel) until the public address
-/// shows up, updating `ngrok_state` as it goes. ngrok can take anywhere
-/// from a couple seconds to (per one real observed run) over a minute to
-/// establish a session, so this is generous about how long it waits rather
-/// than failing fast.
-fn spawn_ngrok(
-    port: u16,
-    ngrok_state: Arc<Mutex<NgrokState>>,
-    ngrok_child: Arc<Mutex<Option<Child>>>,
-    running: Arc<AtomicBool>,
-) {
+/// Bring up an ngrok TCP tunnel *in-process* (no external `ngrok` binary)
+/// that forwards public connections to our own local listener on `port`,
+/// updating `ngrok_state` as it comes up. The authtoken is read from the
+/// `NGROK_AUTHTOKEN` environment variable; without it the tunnel is reported
+/// as unavailable and LAN hosting still works.
+///
+/// This runs on its own OS thread with a single-threaded tokio runtime,
+/// since the rest of the host is plain blocking/threaded code. The tunnel
+/// stays open until `running` flips to false (on power-off), at which point
+/// the forwarder is dropped and the tunnel closes.
+fn spawn_ngrok(port: u16, ngrok_state: Arc<Mutex<NgrokState>>, running: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let child = Command::new("ngrok")
-            .args(["tcp", &port.to_string(), "--log=stdout"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        let child = match child {
-            Ok(c) => c,
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
             Err(e) => {
-                let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                    "ngrok not found - install it from ngrok.com to tunnel from anywhere".to_string()
-                } else {
-                    format!("failed to start ngrok: {e}")
-                };
-                *ngrok_state.lock().unwrap() = NgrokState::Unavailable(msg);
+                *ngrok_state.lock().unwrap() =
+                    NgrokState::Unavailable(format!("couldn't start tunnel runtime: {e}"));
                 return;
             }
         };
-        *ngrok_child.lock().unwrap() = Some(child);
 
-        let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            if !running.load(Ordering::Relaxed) {
-                return;
+        rt.block_on(async move {
+            let authtoken = match std::env::var("NGROK_AUTHTOKEN") {
+                Ok(t) if !t.trim().is_empty() => t,
+                _ => {
+                    *ngrok_state.lock().unwrap() = NgrokState::Unavailable(
+                        "set NGROK_AUTHTOKEN to tunnel from anywhere (free token at ngrok.com)"
+                            .to_string(),
+                    );
+                    return;
+                }
+            };
+
+            let session = match ngrok::Session::builder()
+                .authtoken(authtoken)
+                .connect()
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    *ngrok_state.lock().unwrap() =
+                        NgrokState::Unavailable(format!("ngrok connect failed: {e}"));
+                    return;
+                }
+            };
+
+            // Forward the public tunnel to the same local port our accept
+            // loop is already listening on - so tunnel clients and LAN
+            // clients both land on the one listener.
+            let forward_to =
+                Url::parse(&format!("tcp://localhost:{port}")).expect("valid hard-coded url");
+            let forwarder = match session.tcp_endpoint().listen_and_forward(forward_to).await {
+                Ok(f) => f,
+                Err(e) => {
+                    *ngrok_state.lock().unwrap() =
+                        NgrokState::Unavailable(format!("ngrok tunnel failed: {e}"));
+                    return;
+                }
+            };
+
+            // The URL comes back as `tcp://host:port`; strip the scheme so it
+            // matches the `host:port` form the client's connect box expects.
+            let addr = forwarder.url().trim_start_matches("tcp://").to_string();
+            *ngrok_state.lock().unwrap() = NgrokState::Ready(addr);
+
+            // Hold the forwarder open until power-off. Leaving this scope
+            // drops it, which closes the tunnel.
+            while running.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            if let Some(addr) = query_ngrok_tunnel() {
-                *ngrok_state.lock().unwrap() = NgrokState::Ready(addr);
-                return;
-            }
-            if Instant::now() > deadline {
-                *ngrok_state.lock().unwrap() =
-                    NgrokState::Unavailable("ngrok tunnel didn't start in time".to_string());
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        });
     });
-}
-
-/// Ask ngrok's local API (started alongside the `ngrok` CLI on
-/// 127.0.0.1:4040) for the public address of the tunnel we just asked it to
-/// open. This is the same source of truth the `ngrok` CLI's own log line
-/// comes from - just read directly instead of scraping stdout text.
-fn query_ngrok_tunnel() -> Option<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", 4040)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    stream
-        .write_all(b"GET /api/tunnels HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-
-    let needle = "\"public_url\":\"tcp://";
-    let start = body.find(needle)? + needle.len();
-    let rest = &body[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 /// Best-effort guess at the address other machines on this network would

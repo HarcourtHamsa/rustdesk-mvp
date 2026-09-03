@@ -1,0 +1,21 @@
+# Statically link the MSVC C runtime into the binaries so they run on a clean
+# Windows install without the "VCRUNTIME140.dll was not found" error. Without
+# this, the .exe depends on the Visual C++ Redistributable, which is absent on
+# many laptops.
+#
+# `build.target` is set to an explicit triple on purpose: it makes Cargo compile
+# host artifacts (build scripts and proc-macros) WITHOUT these rustflags, so the
+# `+crt-static` feature only reaches the final binaries. Without an explicit
+# target, the flag also hits proc-macros and breaks the build with errors like
+# "crate `parking_lot_core` required to be available in rlib format".
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

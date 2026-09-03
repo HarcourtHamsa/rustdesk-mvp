@@ -6,11 +6,13 @@
 use eframe::egui;
 use rd_protocol::{hash_password, read_message, write_message, ClientMessage, HostMessage, MouseButton};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const ICON_SIZE: u32 = 256;
 
@@ -54,6 +56,103 @@ struct SharedFrame {
     height: usize,
     rgb: Vec<u8>,
     version: u64,
+}
+
+/// The host's screen-capture target (see rd-host's `target_frame_time`,
+/// ~12 fps). Receiving frames at roughly this rate is treated as "100%".
+const TARGET_FPS: f32 = 12.0;
+/// How far back the strength readout looks when computing the rate.
+const NET_WINDOW: Duration = Duration::from_secs(3);
+
+/// Rolling record of recent frame-arrival times, updated by the receiver
+/// thread and read by the UI thread to gauge how well the stream is keeping
+/// up - the basis for the network-strength readout. A strong link delivers
+/// the host's target rate steadily; a weak one arrives slower and in bursts.
+struct NetworkStats {
+    /// When the session started, so the first few seconds after connecting
+    /// measure against how long we've actually been receiving rather than a
+    /// full window we haven't had time to fill (which would read red on a
+    /// perfectly good link).
+    started: Instant,
+    /// Arrival instants of recent frames, oldest first. Pruned to the
+    /// trailing `NET_WINDOW` on every push, so it never grows without bound.
+    arrivals: VecDeque<Instant>,
+}
+
+/// A computed network-strength readout for display: a 0-100 score, the
+/// color to draw it in, a one-word label, and the raw fps behind it.
+struct NetworkQuality {
+    percent: u8,
+    color: egui::Color32,
+    label: &'static str,
+    fps: f32,
+}
+
+impl NetworkStats {
+    fn new() -> Self {
+        Self { started: Instant::now(), arrivals: VecDeque::new() }
+    }
+
+    /// Record a frame arriving `now`, dropping anything older than the window.
+    fn record(&mut self, now: Instant) {
+        self.arrivals.push_back(now);
+        while let Some(&front) = self.arrivals.front() {
+            if now.duration_since(front) > NET_WINDOW {
+                self.arrivals.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Turn the recent arrivals into a strength readout as of `now`. Combines
+    /// two things a laggy link degrades: throughput (frames/sec against the
+    /// host's target) and the worst recent gap between frames (a single long
+    /// gap is a visible stutter even when the average rate looks fine).
+    fn quality(&self, now: Instant) -> NetworkQuality {
+        const GREEN: egui::Color32 = egui::Color32::from_rgb(0x2e, 0xcc, 0x71);
+        const YELLOW: egui::Color32 = egui::Color32::from_rgb(0xf1, 0xc4, 0x0f);
+        const RED: egui::Color32 = egui::Color32::from_rgb(0xe7, 0x4c, 0x3c);
+
+        let count = self.arrivals.len();
+        if count == 0 {
+            // No frames anywhere in the window - the stream has stalled.
+            return NetworkQuality { percent: 0, color: RED, label: "Stalled", fps: 0.0 };
+        }
+
+        // Measure against how long we've actually been connected, capped at
+        // the window, so a fresh connection isn't punished for not yet having
+        // a full window of history.
+        let span = now.duration_since(self.started).min(NET_WINDOW).as_secs_f32().max(0.5);
+        let fps = count as f32 / span;
+        let throughput = (fps / TARGET_FPS).clamp(0.0, 1.0);
+
+        // Worst gap between consecutive frames, including the time since the
+        // most recent one (so an in-progress stall counts right away).
+        let mut worst_gap_ms =
+            now.duration_since(*self.arrivals.back().unwrap()).as_secs_f32() * 1000.0;
+        for (a, b) in self.arrivals.iter().zip(self.arrivals.iter().skip(1)) {
+            worst_gap_ms = worst_gap_ms.max(b.duration_since(*a).as_secs_f32() * 1000.0);
+        }
+        // Up to ~2 frame-times is still smooth; 750ms+ is a clear stall.
+        const GOOD_GAP_MS: f32 = 166.0;
+        const STALL_GAP_MS: f32 = 750.0;
+        let smoothness =
+            ((STALL_GAP_MS - worst_gap_ms) / (STALL_GAP_MS - GOOD_GAP_MS)).clamp(0.0, 1.0);
+
+        // Mostly throughput, with jitter shaving off up to 30%.
+        let score = 0.7 * throughput + 0.3 * smoothness;
+        let percent = (score * 100.0).round().clamp(0.0, 100.0) as u8;
+
+        let (color, label) = if percent >= 67 {
+            (GREEN, "Strong")
+        } else if percent >= 34 {
+            (YELLOW, "Fair")
+        } else {
+            (RED, "Weak")
+        };
+        NetworkQuality { percent, color, label, fps }
+    }
 }
 
 /// State of the host-side "blank host screen" privacy toggle, updated by
@@ -137,6 +236,9 @@ struct Session {
     remote_w: usize,
     remote_h: usize,
     shared: Arc<Mutex<SharedFrame>>,
+    /// Frame-arrival timing, updated by the receiver thread, read each
+    /// repaint to draw the network-strength readout.
+    network: Arc<Mutex<NetworkStats>>,
     blank_screen: Arc<Mutex<BlankScreenStatus>>,
     guest_input: Arc<Mutex<GuestInputStatus>>,
     keystroke_log: Arc<Mutex<KeystrokeLogStatus>>,
@@ -976,6 +1078,23 @@ fn show_connected(
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(title).strong());
             ui.label(format!("Remote: {}x{}", session.remote_w, session.remote_h));
+
+            // Network-strength readout, pushed to the right edge of the row.
+            // Green/yellow/red with a percentage, indicating how smoothly the
+            // remote screen is keeping up (higher = smoother).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let q = session.network.lock().unwrap().quality(Instant::now());
+                ui.label(
+                    egui::RichText::new(format!("\u{25cf} {}%  {}", q.percent, q.label))
+                        .color(q.color),
+                )
+                .on_hover_text(format!(
+                    "Network strength - how smoothly the remote screen is keeping up.\n\
+                     Receiving {:.0} fps (the host streams ~{:.0}).\n\
+                     Green = strong, yellow = fair, red = weak.",
+                    q.fps, TARGET_FPS,
+                ));
+            });
         });
         if let Some(e) = &session.error {
             ui.colored_label(egui::Color32::LIGHT_RED, e);
@@ -1319,6 +1438,7 @@ fn spawn_connect(
                     rgb: Vec::new(),
                     version: 0,
                 }));
+                let network = Arc::new(Mutex::new(NetworkStats::new()));
                 let blank_screen = Arc::new(Mutex::new(BlankScreenStatus {
                     enabled: false,
                     pending: false,
@@ -1351,6 +1471,7 @@ fn spawn_connect(
                     &stream,
                     SessionHandles {
                         shared: shared.clone(),
+                        network: network.clone(),
                         blank_screen: blank_screen.clone(),
                         guest_input: guest_input.clone(),
                         keystroke_status: keystroke_status.clone(),
@@ -1374,6 +1495,7 @@ fn spawn_connect(
                     remote_w: w,
                     remote_h: h,
                     shared,
+                    network,
                     blank_screen,
                     guest_input,
                     keystroke_log: keystroke_status,
@@ -1405,6 +1527,7 @@ fn spawn_connect(
 /// takes a handful of arguments instead of one per status handle.
 struct SessionHandles {
     shared: Arc<Mutex<SharedFrame>>,
+    network: Arc<Mutex<NetworkStats>>,
     blank_screen: Arc<Mutex<BlankScreenStatus>>,
     guest_input: Arc<Mutex<GuestInputStatus>>,
     keystroke_status: Arc<Mutex<KeystrokeLogStatus>>,
@@ -1427,6 +1550,7 @@ fn spawn_frame_receiver(
 ) -> std::thread::JoinHandle<()> {
     let SessionHandles {
         shared,
+        network,
         blank_screen,
         guest_input,
         keystroke_status,
@@ -1444,6 +1568,10 @@ fn spawn_frame_receiver(
             let msg: Result<HostMessage, _> = read_message(&mut reader_stream);
             match msg {
                 Ok(HostMessage::Frame { width, height, jpeg_bytes }) => {
+                    // Timestamp every frame that arrives (even if it fails to
+                    // decode below) - arrival timing is what the strength
+                    // readout is measuring, independent of decode success.
+                    network.lock().unwrap().record(Instant::now());
                     if let Ok(img) = image::load_from_memory(&jpeg_bytes) {
                         let rgb = img.to_rgb8().into_raw();
                         let v = version_counter.fetch_add(1, Ordering::Relaxed) + 1;
