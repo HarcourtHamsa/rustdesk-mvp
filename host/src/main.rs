@@ -83,11 +83,20 @@ fn print_help() {
 }
 
 fn main() {
-    // Load NGROK_AUTHTOKEN (and anything else) from a .env file next to the
-    // executable or in a parent directory, if present. Missing file is fine -
-    // the token can also come from the real environment, and LAN hosting
-    // works without it either way.
+    // Load NGROK_AUTHTOKEN (and anything else) from a .env file, if present.
+    // Missing file is fine - the token can also come from the real
+    // environment, and LAN hosting works without it either way.
+    //
+    // `dotenvy::dotenv()` only looks relative to the current working
+    // directory, which is wrong when the exe is launched from a shortcut,
+    // a double-click, or a copied/packaged location (the CWD is then
+    // unrelated to where the .env lives, so the token isn't found and the
+    // ngrok tunnel is reported unavailable). So also search next to the
+    // executable and up its parent directories, which is where the .env
+    // actually ships. Real environment variables still win either way -
+    // dotenvy never overrides a variable that's already set.
     let _ = dotenvy::dotenv();
+    load_dotenv_beside_exe();
 
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
@@ -113,6 +122,27 @@ fn main() {
             print_help();
             std::process::exit(1);
         }
+    }
+}
+
+/// Load a `.env` file found next to the executable, or in any of its parent
+/// directories, so the ngrok token is picked up regardless of the working
+/// directory the process was launched with. This complements
+/// `dotenvy::dotenv()` (which only searches from the current directory);
+/// values already set - by the real environment or by that earlier call -
+/// are left untouched.
+fn load_dotenv_beside_exe() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut dir = exe.parent();
+    while let Some(d) = dir {
+        let candidate = d.join(".env");
+        if candidate.is_file() {
+            let _ = dotenvy::from_path(&candidate);
+            return;
+        }
+        dir = d.parent();
     }
 }
 
