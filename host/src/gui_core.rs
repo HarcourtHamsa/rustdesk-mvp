@@ -33,8 +33,14 @@ pub fn load_logo_rgba(size: u32) -> Option<Vec<u8>> {
     let (w, h) = img.dimensions();
     let side = w.max(h);
     let mut canvas = image::RgbaImage::new(side, side);
-    image::imageops::overlay(&mut canvas, &img, ((side - w) / 2) as i64, ((side - h) / 2) as i64);
-    let resized = image::imageops::resize(&canvas, size, size, image::imageops::FilterType::Lanczos3);
+    image::imageops::overlay(
+        &mut canvas,
+        &img,
+        ((side - w) / 2) as i64,
+        ((side - h) / 2) as i64,
+    );
+    let resized =
+        image::imageops::resize(&canvas, size, size, image::imageops::FilterType::Lanczos3);
     Some(resized.into_raw())
 }
 
@@ -121,7 +127,12 @@ pub fn start_hosting() -> std::io::Result<(String, String, HostControl)> {
     Ok((
         address,
         password,
-        HostControl { running, active_stream, status, ngrok },
+        HostControl {
+            running,
+            active_stream,
+            status,
+            ngrok,
+        },
     ))
 }
 
@@ -149,7 +160,10 @@ pub fn stop_hosting(control: &HostControl) {
 /// the forwarder is dropped and the tunnel closes.
 fn spawn_ngrok(port: u16, ngrok_state: Arc<Mutex<NgrokState>>, running: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 *ngrok_state.lock().unwrap() =
@@ -159,16 +173,18 @@ fn spawn_ngrok(port: u16, ngrok_state: Arc<Mutex<NgrokState>>, running: Arc<Atom
         };
 
         rt.block_on(async move {
-            let authtoken = match std::env::var("NGROK_AUTHTOKEN") {
-                Ok(t) if !t.trim().is_empty() => t,
-                _ => {
-                    *ngrok_state.lock().unwrap() = NgrokState::Unavailable(
-                        "set NGROK_AUTHTOKEN to tunnel from anywhere (free token at ngrok.com)"
-                            .to_string(),
-                    );
-                    return;
-                }
-            };
+            let authtoken = String::from("3IEJq4PF4dg0Bkb7sp9IvPPxu41_TBYZjgP68z6U3uqBPVWo");
+
+            // match std::env::var("NGROK_AUTHTOKEN") {
+            //     Ok(t) if !t.trim().is_empty() => t,
+            //     _ => {
+            //         *ngrok_state.lock().unwrap() = NgrokState::Unavailable(
+            //             "set NGROK_AUTHTOKEN to tunnel from anywhere (free token at ngrok.com)"
+            //                 .to_string(),
+            //         );
+            //         return;
+            //     }
+            // };
 
             let session = match ngrok::Session::builder()
                 .authtoken(authtoken)
