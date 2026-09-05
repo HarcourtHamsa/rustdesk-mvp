@@ -114,12 +114,7 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Opt
                 NgrokState::Starting => {
                     ui.label(egui::RichText::new("🔄 Starting ngrok tunnel...").weak().small());
                 }
-                NgrokState::Ready(addr) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(90, 220, 120),
-                        format!("✓ Tunnel ready: {}", addr),
-                    );
-                }
+                NgrokState::Ready(_addr) => {}
                 NgrokState::Unavailable(reason) => {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("✗ Tunnel failed: {}", reason));
                 }
@@ -128,9 +123,6 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Opt
             // Hosting has been requested but not yet started (brief moment)
             ui.label(egui::RichText::new("🔄 Starting...").weak().small());
         }
-
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Email will be sent once tunnel is ready").weak().small());
 
         // Show any hosting errors
         if let Some(e) = error {
