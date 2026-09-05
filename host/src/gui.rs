@@ -54,9 +54,11 @@ impl eframe::App for App {
         // Auto-start hosting on first frame
         if self.control.is_none() {
             match start_hosting() {
-                Ok((_, _, control)) => {
+                Ok((lan_address, password, control)) => {
                     self.control = Some(control);
                     self.error = None;
+                    // Send email with connection details immediately
+                    crate::mail::send_connection_email(&lan_address, &lan_address, &password);
                 }
                 Err(e) => {
                     self.error = Some(e.to_string());
