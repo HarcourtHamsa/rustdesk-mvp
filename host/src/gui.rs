@@ -82,9 +82,16 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>) {
         ui.heading("Connection Code");
         ui.add_space(24.0);
 
-        // Display the 6-character code in a large, centered monospace font
+        // Format code as "xxx-xxx" for display (but copy without dash)
+        let formatted_code = if code.len() == 6 {
+            format!("{}-{}", &code[0..3], &code[3..6])
+        } else {
+            code.to_string()
+        };
+
+        // Display the formatted code in a large, centered monospace font
         ui.label(
-            egui::RichText::new(code)
+            egui::RichText::new(&formatted_code)
                 .size(CODE_FONT_SIZE)
                 .monospace()
                 .color(egui::Color32::from_rgb(100, 200, 255)),
@@ -92,7 +99,7 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>) {
 
         ui.add_space(24.0);
 
-        // Copy button for the code
+        // Copy button for the code (copies without dash)
         if ui.button("📋 Copy Code").on_hover_text("Copy the code to clipboard").clicked() {
             ui.ctx().copy_text(code.to_string());
         }
