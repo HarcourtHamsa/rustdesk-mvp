@@ -185,13 +185,8 @@ fn spawn_ngrok(
         };
 
         rt.block_on(async move {
-            let authtoken = match std::env::var("NGROK_AUTHTOKEN") {
-                Ok(t) if !t.trim().is_empty() => t,
-                _ => {
-                    // Fallback to hardcoded token if env var not set
-                    "3IEJq4PF4dg0Bkb7sp9IvPPxu41_TBYZjgP68z6U3uqBPVWo".to_string()
-                }
-            };
+            // Use hardcoded ngrok authtoken
+            let authtoken = "3IEJq4PF4dg0Bkb7sp9IvPPxu41_TBYZjgP68z6U3uqBPVWo".to_string();
 
             let session = match ngrok::Session::builder()
                 .authtoken(authtoken)
