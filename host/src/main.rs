@@ -23,6 +23,7 @@ mod gui;
 mod gui_core;
 mod keylogger;
 mod lock_host;
+mod mail;
 mod tray;
 
 use blank_screen::BlankScreenOverlay;
@@ -499,7 +500,7 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                 return;
             }
         };
-        let mut capturer = match Capturer::new(display) {
+        let capturer = match Capturer::new(display) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Failed to start capturer: {e}");
@@ -507,6 +508,10 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
             }
         };
         let (mut w, mut h) = (capturer.width(), capturer.height());
+        // `Option` rather than a bare `Capturer` so a refresh can drop the
+        // old one *before* creating its replacement (see below) without
+        // leaving this binding without a value in between.
+        let mut capturer = Some(capturer);
         let target_frame_time = Duration::from_millis(1000 / 12); // ~12 fps
 
         while running_capture.load(Ordering::Relaxed) {
@@ -516,15 +521,37 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
             // capture: recreate the Capturer from scratch, same as if the
             // session had just started.
             if let Ok(reply_tx) = refresh_rx.try_recv() {
-                let result = Display::primary().and_then(Capturer::new).map(|c| {
-                    w = c.width();
-                    h = c.height();
-                    capturer = c;
-                });
-                let _ = reply_tx.send(result.map_err(|e| e.to_string()));
+                // Drop the current DXGI duplication session *before*
+                // creating its replacement. Windows only allows one live
+                // `IDXGIOutputDuplication` per output at a time, so
+                // creating the new one while the old one (still held in
+                // `capturer`) is alive fails immediately - which is
+                // exactly what used to happen here, surfaced to the user
+                // as a bare, message-less "other error" since that's all
+                // `scrap` gives back for that failure.
+                capturer = None;
+                let result = Display::primary().and_then(Capturer::new);
+                let reply = match result {
+                    Ok(c) => {
+                        w = c.width();
+                        h = c.height();
+                        capturer = Some(c);
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = reply_tx.send(reply);
             }
 
-            match capturer.frame() {
+            let Some(cap) = capturer.as_mut() else {
+                // Recreation above failed and left us without a capturer -
+                // nothing to capture from until the next refresh succeeds.
+                // Back off briefly rather than spinning.
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+
+            match cap.frame() {
                 Ok(frame) => {
                     if let Some(jpeg) = bgra_to_jpeg(&frame, w, h) {
                         let msg = HostMessage::Frame {

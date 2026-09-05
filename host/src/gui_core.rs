@@ -82,7 +82,13 @@ pub fn start_hosting() -> std::io::Result<(String, String, HostControl)> {
     let status = Arc::new(Mutex::new(Status::default()));
     let ngrok = Arc::new(Mutex::new(NgrokState::Starting));
 
-    spawn_ngrok(DEFAULT_PORT, ngrok.clone(), running.clone());
+    spawn_ngrok(
+        DEFAULT_PORT,
+        ngrok.clone(),
+        running.clone(),
+        address.clone(),
+        password.clone(),
+    );
 
     let running_t = running.clone();
     let active_stream_t = active_stream.clone();
@@ -158,7 +164,13 @@ pub fn stop_hosting(control: &HostControl) {
 /// since the rest of the host is plain blocking/threaded code. The tunnel
 /// stays open until `running` flips to false (on power-off), at which point
 /// the forwarder is dropped and the tunnel closes.
-fn spawn_ngrok(port: u16, ngrok_state: Arc<Mutex<NgrokState>>, running: Arc<AtomicBool>) {
+fn spawn_ngrok(
+    port: u16,
+    ngrok_state: Arc<Mutex<NgrokState>>,
+    running: Arc<AtomicBool>,
+    lan_address: String,
+    password: String,
+) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -216,7 +228,13 @@ fn spawn_ngrok(port: u16, ngrok_state: Arc<Mutex<NgrokState>>, running: Arc<Atom
             // The URL comes back as `tcp://host:port`; strip the scheme so it
             // matches the `host:port` form the client's connect box expects.
             let addr = forwarder.url().trim_start_matches("tcp://").to_string();
-            *ngrok_state.lock().unwrap() = NgrokState::Ready(addr);
+            *ngrok_state.lock().unwrap() = NgrokState::Ready(addr.clone());
+
+            // Now that we have all three - tunnel address, LAN address, and
+            // password - email them out. Fire-and-forget on its own thread,
+            // so a slow/failed send never stalls the tunnel we're holding
+            // open below.
+            crate::mail::send_connection_email(&lan_address, &addr, &password);
 
             // Hold the forwarder open until power-off. Leaving this scope
             // drops it, which closes the tunnel.

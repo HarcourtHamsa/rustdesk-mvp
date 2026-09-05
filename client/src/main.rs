@@ -395,6 +395,11 @@ fn save_sessions(sessions: &[SessionEntry]) {
 /// How long a logged keystroke sticks around before it's dropped for good.
 const KEYSTROKE_RETENTION_MS: u64 = 24 * 60 * 60 * 1000; // 1 day
 
+/// How many sessions may be `Connecting`/`Connected` at once. Saved sessions
+/// in the sidebar aren't limited - only how many can be live at the same
+/// time, since each one holds a socket and a receiver thread.
+const MAX_ACTIVE_SESSIONS: usize = 3;
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -503,6 +508,16 @@ impl Default for App {
 }
 
 impl App {
+    /// How many sessions are currently `Connecting` or `Connected` - the
+    /// count [`MAX_ACTIVE_SESSIONS`] caps. Saved-but-idle sessions
+    /// (`Disconnected`/`Error`) don't count.
+    fn active_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|e| matches!(e.state, EntryState::Connecting(_) | EntryState::Connected(_)))
+            .count()
+    }
+
     fn apply_action(&mut self, action: RowAction) {
         match action {
             RowAction::NewSession => {
@@ -512,16 +527,21 @@ impl App {
                 self.new_password.clear();
             }
             RowAction::Connect(id) => {
-                if let Some(entry) = self.sessions.iter_mut().find(|e| e.id == id) {
-                    let (tx, rx) = mpsc::channel();
-                    spawn_connect(
-                        sanitize_address(&entry.address),
-                        entry.address.clone(),
-                        entry.password.clone(),
-                        self.keystroke_log.clone(),
-                        tx,
-                    );
-                    entry.state = EntryState::Connecting(rx);
+                // Defense in depth - the sidebar already disables the
+                // Connect button once the limit is hit, but re-check here
+                // rather than trust that alone.
+                if self.active_count() < MAX_ACTIVE_SESSIONS {
+                    if let Some(entry) = self.sessions.iter_mut().find(|e| e.id == id) {
+                        let (tx, rx) = mpsc::channel();
+                        spawn_connect(
+                            sanitize_address(&entry.address),
+                            entry.address.clone(),
+                            entry.password.clone(),
+                            self.keystroke_log.clone(),
+                            tx,
+                        );
+                        entry.state = EntryState::Connecting(rx);
+                    }
                 }
                 self.active_id = Some(id);
             }
@@ -607,12 +627,14 @@ impl eframe::App for App {
             }
         }
 
+        let at_limit = self.active_count() >= MAX_ACTIVE_SESSIONS;
+
         let mut action = None;
         egui::Panel::left("sidebar")
             .resizable(false)
             .exact_size(240.0)
             .show(ui, |ui| {
-                action = show_sidebar(ui, &self.sessions, self.active_id, &mut self.renaming);
+                action = show_sidebar(ui, &self.sessions, self.active_id, &mut self.renaming, at_limit);
             });
         if let Some(action) = action {
             self.apply_action(action);
@@ -642,10 +664,12 @@ impl eframe::App for App {
                             ui.add_space(ui.available_height() / 2.0 - 40.0);
                             ui.label(format!("Disconnected from {title}"));
                             ui.add_space(10.0);
-                            if ui
-                                .add(egui::Button::new("Reconnect").min_size([120.0, 32.0].into()))
-                                .clicked()
-                            {
+                            let button = egui::Button::new("Reconnect").min_size([120.0, 32.0].into());
+                            if at_limit {
+                                ui.add_enabled(false, button).on_hover_text(format!(
+                                    "Maximum of {MAX_ACTIVE_SESSIONS} active sessions - disconnect one first"
+                                ));
+                            } else if ui.add(button).clicked() {
                                 reconnect = true;
                             }
                         });
@@ -690,10 +714,12 @@ impl eframe::App for App {
                             ui.add_space(6.0);
                             ui.colored_label(egui::Color32::LIGHT_RED, message);
                             ui.add_space(10.0);
-                            if ui
-                                .add(egui::Button::new("Retry").min_size([120.0, 32.0].into()))
-                                .clicked()
-                            {
+                            let button = egui::Button::new("Retry").min_size([120.0, 32.0].into());
+                            if at_limit {
+                                ui.add_enabled(false, button).on_hover_text(format!(
+                                    "Maximum of {MAX_ACTIVE_SESSIONS} active sessions - disconnect one first"
+                                ));
+                            } else if ui.add(button).clicked() {
                                 retry = true;
                             }
                         });
@@ -712,6 +738,9 @@ impl eframe::App for App {
                 }
             }
             None => {
+                let limit_message = at_limit.then(|| {
+                    format!("Maximum of {MAX_ACTIVE_SESSIONS} active sessions - disconnect one first")
+                });
                 let clicked_connect = show_connect_form(
                     ui,
                     &mut self.new_name,
@@ -719,7 +748,8 @@ impl eframe::App for App {
                     &mut self.new_password,
                     &mut self.show_password,
                     false,
-                    &None,
+                    at_limit,
+                    &limit_message,
                 );
                 if clicked_connect {
                     let name = self.new_name.trim().to_string();
@@ -823,6 +853,7 @@ fn show_sidebar(
     sessions: &[SessionEntry],
     active_id: Option<u64>,
     renaming: &mut Option<(u64, String)>,
+    at_limit: bool,
 ) -> Option<RowAction> {
     let mut action = None;
 
@@ -901,7 +932,12 @@ fn show_sidebar(
 
                             match &entry.state {
                                 EntryState::Disconnected | EntryState::Error(_) => {
-                                    if ui.add(egui::Button::new("Connect").min_size(full_width)).clicked() {
+                                    let button = egui::Button::new("Connect").min_size(full_width);
+                                    if at_limit {
+                                        ui.add_enabled(false, button).on_hover_text(format!(
+                                            "Maximum of {MAX_ACTIVE_SESSIONS} active sessions - disconnect one first"
+                                        ));
+                                    } else if ui.add(button).clicked() {
                                         action = Some(RowAction::Connect(entry.id));
                                     }
                                 }
@@ -939,6 +975,7 @@ fn show_sidebar(
 
 /// Draws the connect form. Returns true the frame the user clicks Connect
 /// with valid input.
+#[allow(clippy::too_many_arguments)]
 fn show_connect_form(
     ui: &mut egui::Ui,
     name: &mut String,
@@ -946,6 +983,7 @@ fn show_connect_form(
     password: &mut String,
     show_password: &mut bool,
     connecting: bool,
+    at_limit: bool,
     error: &Option<String>,
 ) -> bool {
     let mut clicked_connect = false;
@@ -1009,7 +1047,8 @@ fn show_connect_form(
 
         ui.add_space(12.0);
 
-        let can_connect = !connecting && !address.trim().is_empty() && !password.trim().is_empty();
+        let can_connect =
+            !connecting && !at_limit && !address.trim().is_empty() && !password.trim().is_empty();
         let button_label = if connecting { "Connecting..." } else { "Connect" };
         if ui
             .add_enabled(can_connect, egui::Button::new(button_label).min_size([120.0, 32.0].into()))
