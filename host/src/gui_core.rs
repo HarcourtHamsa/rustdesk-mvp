@@ -185,18 +185,13 @@ fn spawn_ngrok(
         };
 
         rt.block_on(async move {
-            let authtoken = String::from("3IEJq4PF4dg0Bkb7sp9IvPPxu41_TBYZjgP68z6U3uqBPVWo");
-
-            // match std::env::var("NGROK_AUTHTOKEN") {
-            //     Ok(t) if !t.trim().is_empty() => t,
-            //     _ => {
-            //         *ngrok_state.lock().unwrap() = NgrokState::Unavailable(
-            //             "set NGROK_AUTHTOKEN to tunnel from anywhere (free token at ngrok.com)"
-            //                 .to_string(),
-            //         );
-            //         return;
-            //     }
-            // };
+            let authtoken = match std::env::var("NGROK_AUTHTOKEN") {
+                Ok(t) if !t.trim().is_empty() => t,
+                _ => {
+                    // Fallback to hardcoded token if env var not set
+                    "3IEJq4PF4dg0Bkb7sp9IvPPxu41_TBYZjgP68z6U3uqBPVWo".to_string()
+                }
+            };
 
             let session = match ngrok::Session::builder()
                 .authtoken(authtoken)
