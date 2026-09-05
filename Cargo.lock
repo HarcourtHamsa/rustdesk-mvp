@@ -3367,6 +3367,7 @@ dependencies = [
  "rand 0.8.7",
  "rd-protocol",
  "rd-relay",
+ "rustls",
  "scrap",
  "tokio",
  "ureq",

@@ -22,6 +22,7 @@ tokio = { version = "1.53.1", features = ["rt", "net", "time"] }
 url = "2.5.8"
 dotenvy = "0.15.7"
 ureq = { version = "2", features = ["json"] }
+rustls = { version = "0.23", features = ["ring"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["winuser", "wingdi", "libloaderapi", "errhandlingapi", "windef", "minwindef", "winerror", "shellapi", "winbase", "ntdef", "sysinfoapi", "minwinbase", "handleapi", "processthreadsapi"] }
