@@ -62,15 +62,15 @@ pub fn generate_random_code() -> String {
 fn print_help() {
     println!("rd-host [mode] [options]");
     println!();
-    println!("With no arguments, starts hosting immediately and sits in the system");
-    println!("tray - no window. Right-click the tray icon to copy the address/");
-    println!("password, open the connection log, or quit. The address and password");
-    println!("are also appended to rd-host-connections.log next to the executable");
-    println!("once the ngrok tunnel finishes starting (or gives up).");
+    println!("With no arguments, opens a visible window showing a connection code");
+    println!("that you can copy. Click START to begin hosting.");
     println!();
-    println!("  --window");
-    println!("      Show the old visible window instead (a Start/Stop button you");
-    println!("      click yourself, with the address/password shown right there).");
+    println!("  --tray");
+    println!("      Run in system tray mode instead (no window). Right-click the");
+    println!("      tray icon to copy the address/password, open the connection log,");
+    println!("      or quit. The address and password are also appended to");
+    println!("      rd-host-connections.log next to the executable once the ngrok");
+    println!("      tunnel finishes starting (or gives up).");
     println!();
     println!("Modes (for scripted/headless use, e.g. running rd-relay on a VPS):");
     println!("  listen [--port <port>] [--password <password>]");
@@ -127,14 +127,14 @@ fn main() {
     let mode = args.next().unwrap_or_default();
     match mode.as_str() {
         "" => {
-            if let Err(e) = tray::run() {
-                eprintln!("Failed to start: {e}");
+            if let Err(e) = gui::run() {
+                eprintln!("Failed to open GUI: {e}");
                 std::process::exit(1);
             }
         }
-        "--window" => {
-            if let Err(e) = gui::run() {
-                eprintln!("Failed to open GUI: {e}");
+        "--tray" => {
+            if let Err(e) = tray::run() {
+                eprintln!("Failed to start: {e}");
                 std::process::exit(1);
             }
         }
