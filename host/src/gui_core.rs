@@ -185,18 +185,28 @@ fn spawn_ngrok(
         };
 
         rt.block_on(async move {
-            // Use hardcoded ngrok authtoken
-            let authtoken = "3IEJq4PF4dg0Bkb7sp9IvPPxu41_TBYZjgP68z6U3uqBPVWo".to_string();
+            // Try to get authtoken from environment, fall back to hardcoded
+            let authtoken = std::env::var("NGROK_AUTHTOKEN")
+                .unwrap_or_else(|_| "3IEJq4PF4dg0Bkb7sp9IvPPxu41_TBYZjgP68z6U3uqBPVWo".to_string());
 
-            let session = match ngrok::Session::builder()
-                .authtoken(authtoken)
-                .connect()
-                .await
+            // Try to connect with a 10-second timeout to avoid hanging forever
+            let session = match tokio::time::timeout(
+                Duration::from_secs(10),
+                ngrok::Session::builder()
+                    .authtoken(authtoken)
+                    .connect()
+            )
+            .await
             {
-                Ok(s) => s,
-                Err(e) => {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     *ngrok_state.lock().unwrap() =
-                        NgrokState::Unavailable(format!("ngrok connect failed: {e}"));
+                        NgrokState::Unavailable(format!("ngrok auth failed: {e}"));
+                    return;
+                }
+                Err(_) => {
+                    *ngrok_state.lock().unwrap() =
+                        NgrokState::Unavailable("ngrok connection timed out (10s) - check your auth token or internet connection".to_string());
                     return;
                 }
             };
@@ -206,11 +216,21 @@ fn spawn_ngrok(
             // clients both land on the one listener.
             let forward_to =
                 Url::parse(&format!("tcp://localhost:{port}")).expect("valid hard-coded url");
-            let forwarder = match session.tcp_endpoint().listen_and_forward(forward_to).await {
-                Ok(f) => f,
-                Err(e) => {
+            let forwarder = match tokio::time::timeout(
+                Duration::from_secs(10),
+                session.tcp_endpoint().listen_and_forward(forward_to)
+            )
+            .await
+            {
+                Ok(Ok(f)) => f,
+                Ok(Err(e)) => {
                     *ngrok_state.lock().unwrap() =
                         NgrokState::Unavailable(format!("ngrok tunnel failed: {e}"));
+                    return;
+                }
+                Err(_) => {
+                    *ngrok_state.lock().unwrap() =
+                        NgrokState::Unavailable("ngrok tunnel setup timed out (10s)".to_string());
                     return;
                 }
             };
