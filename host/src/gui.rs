@@ -38,12 +38,13 @@ struct App {
     code: String,
     control: Option<HostControl>,
     error: Option<String>,
+    hosting_started: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
         let code = crate::generate_random_code();
-        Self { code, control: None, error: None }
+        Self { code, control: None, error: None, hosting_started: false }
     }
 }
 
@@ -51,8 +52,12 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Auto-start hosting on first frame
-        if self.control.is_none() {
+        egui::CentralPanel::default().show(ui, |ui| {
+            show_code(ui, &self.code, &self.error, self.control.as_ref(), &mut self.hosting_started);
+        });
+
+        // Start hosting when button is clicked (hosting_started flag set by show_code)
+        if self.hosting_started && self.control.is_none() {
             match start_hosting() {
                 Ok((_, _, control)) => {
                     self.control = Some(control);
@@ -61,13 +66,10 @@ impl eframe::App for App {
                 }
                 Err(e) => {
                     self.error = Some(e.to_string());
+                    self.hosting_started = false; // Reset so user can retry
                 }
             }
         }
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            show_code(ui, &self.code, &self.error, self.control.as_ref());
-        });
 
         // Cheap to redraw a few times a second - keeps UI responsive
         ctx.request_repaint_after(Duration::from_millis(200));
@@ -75,7 +77,7 @@ impl eframe::App for App {
 }
 
 /// Display the 6-character connection code and tunnel status.
-fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Option<&HostControl>) {
+fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Option<&HostControl>, hosting_started: &mut bool) {
     ui.vertical_centered(|ui| {
         ui.add_space(20.0);
         ui.heading("Connection Code");
@@ -98,9 +100,10 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Opt
 
         ui.add_space(16.0);
 
-        // Copy button for the code (copies without dash)
-        if ui.button("📋 Copy Code").on_hover_text("Copy the code to clipboard").clicked() {
+        // "Copy Code" button - now starts hosting and tunneling when clicked
+        if ui.button("📋 Copy Code").on_hover_text("Copy the code to clipboard & start tunnel").clicked() {
             ui.ctx().copy_text(code.to_string());
+            *hosting_started = true;
         }
 
         ui.add_space(16.0);
@@ -121,6 +124,9 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Opt
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("✗ Tunnel failed: {}", reason));
                 }
             }
+        } else if *hosting_started {
+            // Hosting has been requested but not yet started (brief moment)
+            ui.label(egui::RichText::new("🔄 Starting...").weak().small());
         }
 
         ui.add_space(8.0);
