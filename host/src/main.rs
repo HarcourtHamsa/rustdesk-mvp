@@ -93,6 +93,16 @@ fn print_help() {
 }
 
 fn main() {
+    // Install rustls's crypto provider before anything touches TLS (the
+    // ngrok tunnel does, via hyper-rustls/tokio-rustls). Both the `ring`
+    // and `aws-lc-rs` backends end up compiled in here - ngrok itself
+    // enables `aws-lc-rs` as a default feature, while another dependency
+    // in the tree pulls in `ring` - so rustls can't auto-select one and
+    // panics at first use ("Could not automatically determine the
+    // process-level CryptoProvider") unless we pick one explicitly, up
+    // front, before any TLS handshake can start.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Make the whole process DPI-aware before anything captures the screen.
     // On a display with scaling (e.g. 125%/150%), a DPI-unaware process sees
     // the virtualized *logical* resolution (e.g. 1280x720) while the capture
