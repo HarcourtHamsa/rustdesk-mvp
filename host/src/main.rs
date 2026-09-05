@@ -50,6 +50,15 @@ fn generate_random_password() -> String {
         .collect()
 }
 
+pub fn generate_random_code() -> String {
+    use rand::Rng;
+    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
+}
+
 fn print_help() {
     println!("rd-host [mode] [options]");
     println!();
