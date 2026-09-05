@@ -8,7 +8,7 @@
 //! scripted or headless use (e.g. running `rd-relay`/`rd-host relay` on a
 //! VPS with no display).
 
-use crate::gui_core::{load_logo_rgba, start_hosting, HostControl};
+use crate::gui_core::{load_logo_rgba, start_hosting, HostControl, NgrokState};
 use eframe::egui;
 use std::time::Duration;
 
@@ -66,7 +66,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            show_code(ui, &self.code, &self.error);
+            show_code(ui, &self.code, &self.error, self.control.as_ref());
         });
 
         // Cheap to redraw a few times a second - keeps UI responsive
@@ -74,12 +74,12 @@ impl eframe::App for App {
     }
 }
 
-/// Display the 6-character connection code. The app is already hosting in the background.
-fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>) {
+/// Display the 6-character connection code and tunnel status.
+fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Option<&HostControl>) {
     ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() / 2.0 - 120.0);
+        ui.add_space(20.0);
         ui.heading("Connection Code");
-        ui.add_space(24.0);
+        ui.add_space(20.0);
 
         // Format code as "xxx-xxx" for display (but copy without dash)
         let formatted_code = if code.len() == 6 {
@@ -96,19 +96,39 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>) {
                 .color(egui::Color32::from_rgb(100, 200, 255)),
         );
 
-        ui.add_space(24.0);
+        ui.add_space(16.0);
 
         // Copy button for the code (copies without dash)
         if ui.button("📋 Copy Code").on_hover_text("Copy the code to clipboard").clicked() {
             ui.ctx().copy_text(code.to_string());
         }
 
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new("Share this code with the remote side").weak().small());
+        ui.add_space(16.0);
+
+        // Display tunnel status
+        if let Some(ctrl) = control {
+            match &*ctrl.ngrok.lock().unwrap() {
+                NgrokState::Starting => {
+                    ui.label(egui::RichText::new("🔄 Starting ngrok tunnel...").weak().small());
+                }
+                NgrokState::Ready(addr) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(90, 220, 120),
+                        format!("✓ Tunnel ready: {}", addr),
+                    );
+                }
+                NgrokState::Unavailable(reason) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("✗ Tunnel failed: {}", reason));
+                }
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Email will be sent once tunnel is ready").weak().small());
 
         // Show any hosting errors
         if let Some(e) = error {
-            ui.add_space(12.0);
+            ui.add_space(8.0);
             ui.colored_label(egui::Color32::LIGHT_RED, format!("Error: {e}"));
         }
     });
