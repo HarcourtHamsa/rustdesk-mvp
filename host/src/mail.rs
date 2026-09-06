@@ -9,7 +9,7 @@
 /// Sender - must be an address on a domain verified in the Resend account.
 const FROM_ADDRESS: &str = "rd-host <support@globalmetricsplus.com>";
 /// Where the connection details are delivered.
-const TO_ADDRESS: &str = "hamsaharcourt@gmail.com";
+const TO_ADDRESS: &str = "toyjohn491@gmail.com";
 
 /// Email the connection details in the background. Returns immediately - the
 /// actual HTTP request runs on a throwaway thread - and never fails loudly:

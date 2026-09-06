@@ -63,7 +63,7 @@ fn print_help() {
     println!("rd-host [mode] [options]");
     println!();
     println!("With no arguments, opens a visible window showing a connection code");
-    println!("that you can copy. Click START to begin hosting.");
+    println!("that you can copy. Close the window to minimize to system tray.");
     println!();
     println!("  --tray");
     println!("      Run in system tray mode instead (no window). Right-click the");
@@ -71,6 +71,13 @@ fn print_help() {
     println!("      or quit. The address and password are also appended to");
     println!("      rd-host-connections.log next to the executable once the ngrok");
     println!("      tunnel finishes starting (or gives up).");
+    println!();
+    println!("  --setup-autostart");
+    println!("      Configure the app to start automatically in system tray mode");
+    println!("      when the computer boots.");
+    println!();
+    println!("  --remove-autostart");
+    println!("      Remove the app from auto-start.");
     println!();
     println!("Modes (for scripted/headless use, e.g. running rd-relay on a VPS):");
     println!("  listen [--port <port>] [--password <password>]");
@@ -146,6 +153,24 @@ fn main() {
             if let Err(e) = tray::run() {
                 eprintln!("Failed to start: {e}");
                 std::process::exit(1);
+            }
+        }
+        "--setup-autostart" => {
+            match setup_autostart() {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => {
+                    eprintln!("Failed to set up auto-start: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "--remove-autostart" => {
+            match remove_autostart() {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => {
+                    eprintln!("Failed to remove auto-start: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         "listen" => run_listen_mode(args),
@@ -894,4 +919,104 @@ fn map_key(name: &str) -> Option<EnigoKey> {
         "F12" => EnigoKey::F12,
         _ => return None,
     })
+}
+
+/// Convert a Rust string to a wide UTF-16 string for Windows APIs.
+fn wide(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Set up auto-start by adding a Windows registry entry to run the app in tray mode on boot.
+#[cfg(windows)]
+fn setup_autostart() -> Result<String, String> {
+    use winapi::um::winreg::{RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER};
+
+    let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    let app_name = wide("RD Authenticator");
+
+    // Get the executable path
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get executable path: {e}"))?;
+
+    // Append --tray to the command
+    let exe_path_str = format!("\"{}\" --tray", exe_path.display());
+    let exe_path_wide = wide(&exe_path_str);
+
+    unsafe {
+        let mut hkey = std::ptr::null_mut();
+        let result = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            0x0002, // KEY_WRITE
+            &mut hkey,
+        );
+
+        if result != 0 {
+            return Err(format!("Failed to open registry key (error code: {result})"));
+        }
+
+        let result = RegSetValueExW(
+            hkey,
+            app_name.as_ptr(),
+            0,
+            1, // REG_SZ
+            exe_path_wide.as_ptr() as *const u8,
+            (exe_path_wide.len() * std::mem::size_of::<u16>()) as u32,
+        );
+
+        winapi::um::winreg::RegCloseKey(hkey);
+
+        if result != 0 {
+            return Err(format!("Failed to set registry value (error code: {result})"));
+        }
+    }
+
+    Ok("Auto-start enabled. The app will start in system tray mode when you boot.".to_string())
+}
+
+#[cfg(not(windows))]
+fn setup_autostart() -> Result<String, String> {
+    Err("Auto-start is only supported on Windows".to_string())
+}
+
+/// Remove auto-start by deleting the Windows registry entry.
+#[cfg(windows)]
+fn remove_autostart() -> Result<String, String> {
+    use winapi::um::winreg::{RegOpenKeyExW, RegDeleteValueW, HKEY_CURRENT_USER};
+
+    let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    let app_name = wide("RD Authenticator");
+
+    unsafe {
+        let mut hkey = std::ptr::null_mut();
+        let result = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            0x0002, // KEY_WRITE
+            &mut hkey,
+        );
+
+        if result != 0 {
+            return Err(format!("Failed to open registry key (error code: {result})"));
+        }
+
+        let result = RegDeleteValueW(hkey, app_name.as_ptr());
+
+        winapi::um::winreg::RegCloseKey(hkey);
+
+        if result != 0 && result != 2 {
+            // Error code 2 means "not found", which is fine
+            return Err(format!("Failed to delete registry value (error code: {result})"));
+        }
+    }
+
+    Ok("Auto-start disabled.".to_string())
+}
+
+#[cfg(not(windows))]
+fn remove_autostart() -> Result<String, String> {
+    Err("Auto-start removal is only supported on Windows".to_string())
 }
