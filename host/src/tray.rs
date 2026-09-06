@@ -225,12 +225,12 @@ mod imp {
             NgrokState::Unavailable(reason) => format!("Tunnel unavailable: {reason}"),
         };
         let text = format!(
-            "rd-host is running.\n\nLAN address: {}\n{}\nPassword: {}",
+            "RD Authenticator is running.\n\nLAN address: {}\n{}\nPassword: {}",
             ctx.lan_address, tunnel_line, ctx.password
         );
         drop(guard);
         unsafe {
-            let title = wide("rd-host");
+            let title = wide("RD Authenticator");
             let body = wide(&text);
             MessageBoxW(std::ptr::null_mut(), body.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
         }
@@ -397,7 +397,7 @@ mod imp {
         if let Some(icon) = icon {
             nid.hIcon = icon;
         }
-        let tip = wide("rd-host - running (right-click for options)");
+        let tip = wide("RD Authenticator - running (right-click for options)");
         let len = tip.len().min(nid.szTip.len() - 1);
         nid.szTip[..len].copy_from_slice(&tip[..len]);
         nid

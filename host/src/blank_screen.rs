@@ -346,7 +346,7 @@ mod imp {
             let w = GetSystemMetrics(SM_CXSCREEN);
             let h = GetSystemMetrics(SM_CYSCREEN);
 
-            let title = wide("rd-host blank screen");
+            let title = wide("RD Authenticator blank screen");
             let hwnd = CreateWindowExW(
                 // WS_EX_TRANSPARENT is the important one here: without it,
                 // this topmost, full-screen window swallows every mouse

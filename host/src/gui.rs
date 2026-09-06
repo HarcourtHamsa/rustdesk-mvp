@@ -25,7 +25,7 @@ pub fn run() -> eframe::Result<()> {
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
-        "rd-host",
+        "RD Authenticator",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
