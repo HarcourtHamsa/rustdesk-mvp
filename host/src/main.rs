@@ -533,63 +533,60 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
     let running_capture = running.clone();
     let latest_frame_writer = latest_frame.clone();
     let capture_thread = std::thread::spawn(move || {
-        let display = match Display::primary() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Failed to open display: {e}");
-                return;
-            }
-        };
-        let capturer = match Capturer::new(display) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to start capturer: {e}");
-                return;
-            }
-        };
-        let (mut w, mut h) = (capturer.width(), capturer.height());
-        // `Option` rather than a bare `Capturer` so a refresh can drop the
-        // old one *before* creating its replacement (see below) without
-        // leaving this binding without a value in between.
-        let mut capturer = Some(capturer);
+        // Lazily created, and recreated on demand: both a refresh request and
+        // a capture error drop the old duplication and build a fresh one.
+        // `None` means "needs (re)creating on the next tick".
+        let mut capturer: Option<Capturer> = None;
+        let (mut w, mut h) = (0usize, 0usize);
         let target_frame_time = Duration::from_millis(1000 / 12); // ~12 fps
 
         while running_capture.load(Ordering::Relaxed) {
             let frame_start = std::time::Instant::now();
 
-            // A pending refresh request takes priority over this tick's
-            // capture: recreate the Capturer from scratch, same as if the
-            // session had just started.
+            // A refresh request recreates the Capturer from scratch and reports
+            // the outcome back to whoever asked (the RefreshScreen handler in
+            // the input loop). Recreation is the standard fix for a DXGI
+            // duplication that's gotten stuck after a desktop transition - but
+            // the loop below now also recreates on its own when a capture error
+            // signals the same thing, so a refresh is just a manual trigger of
+            // recovery that already happens automatically.
             if let Ok(reply_tx) = refresh_rx.try_recv() {
-                // Drop the current DXGI duplication session *before*
-                // creating its replacement. Windows only allows one live
-                // `IDXGIOutputDuplication` per output at a time, so
-                // creating the new one while the old one (still held in
-                // `capturer`) is alive fails immediately - which is
-                // exactly what used to happen here, surfaced to the user
-                // as a bare, message-less "other error" since that's all
-                // `scrap` gives back for that failure.
+                // Drop the current duplication *before* creating its
+                // replacement - Windows allows only one live
+                // IDXGIOutputDuplication per output at a time.
                 capturer = None;
-                let result = Display::primary().and_then(Capturer::new);
-                let reply = match result {
-                    Ok(c) => {
-                        w = c.width();
-                        h = c.height();
+                let reply = match make_capturer(&running_capture) {
+                    Ok((c, nw, nh)) => {
+                        w = nw;
+                        h = nh;
                         capturer = Some(c);
                         Ok(())
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e),
                 };
                 let _ = reply_tx.send(reply);
             }
 
-            let Some(cap) = capturer.as_mut() else {
-                // Recreation above failed and left us without a capturer -
-                // nothing to capture from until the next refresh succeeds.
-                // Back off briefly rather than spinning.
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            };
+            // Ensure we have a working capturer, (re)creating it if a prior
+            // error or a failed refresh left us without one. If creation is
+            // still failing (e.g. we're sitting on the secure desktop), back
+            // off and retry next tick rather than spinning - the thread stays
+            // alive and responsive to `running` either way, so teardown and
+            // future refreshes still work.
+            if capturer.is_none() {
+                match make_capturer(&running_capture) {
+                    Ok((c, nw, nh)) => {
+                        w = nw;
+                        h = nh;
+                        capturer = Some(c);
+                    }
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                }
+            }
+            let Some(cap) = capturer.as_mut() else { continue };
 
             match cap.frame() {
                 Ok(frame) => {
@@ -606,8 +603,17 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                     // frame not ready yet, just retry
                 }
                 Err(e) => {
-                    eprintln!("Capture error: {e}");
-                    break;
+                    // A real capture error - almost always DXGI_ERROR_ACCESS_LOST
+                    // after a desktop switch (lock/unlock, UAC's secure desktop,
+                    // a resolution change), which permanently invalidates this
+                    // duplication. Drop it and recreate on the next tick rather
+                    // than killing the capture thread (the old behavior, which
+                    // froze the client on the last frame and left the thread
+                    // unable to serve the refresh meant to recover from exactly
+                    // this).
+                    eprintln!("Capture error, recreating capturer: {e}");
+                    capturer = None;
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
             let elapsed = frame_start.elapsed();
@@ -845,6 +851,35 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
     let _ = clip_forward_thread.join();
     println!("Client {peer:?} disconnected.");
     Ok(())
+}
+
+/// Create a fresh screen `Capturer`, retrying briefly before giving up.
+///
+/// A single attempt is unreliable on Windows: right after an old DXGI
+/// duplication is dropped, the OS may not have released it yet, and certain
+/// desktop transitions (lock/unlock, UAC's secure desktop, a resolution
+/// change) leave duplication momentarily unavailable - so a creation that
+/// fails now often succeeds a fraction of a second later. Retries for ~2s,
+/// bailing out early if `running` goes false so a closing session tears down
+/// promptly. Returns the capturer with its width/height, or the last error.
+fn make_capturer(running: &AtomicBool) -> Result<(Capturer, usize, usize), String> {
+    let mut last_err = "screen capture unavailable".to_string();
+    for _ in 0..20 {
+        if !running.load(Ordering::Relaxed) {
+            return Err("connection closing".to_string());
+        }
+        match Display::primary().and_then(Capturer::new) {
+            Ok(c) => {
+                let (w, h) = (c.width(), c.height());
+                return Ok((c, w, h));
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Convert a captured BGRA frame (which may have row padding) into JPEG bytes.
