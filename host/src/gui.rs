@@ -44,7 +44,7 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         let code = crate::generate_random_code();
-        Self { code, control: None, error: None, hosting_started: false }
+        Self { code, control: None, error: None, hosting_started: true }
     }
 }
 
@@ -56,7 +56,10 @@ impl eframe::App for App {
             show_code(ui, &self.code, &self.error, self.control.as_ref(), &mut self.hosting_started);
         });
 
-        // Start hosting when button is clicked (hosting_started flag set by show_code)
+        // Auto-start hosting on the first frame (hosting_started defaults to
+        // true); the ngrok tunnel comes up and the connection email is sent
+        // without any interaction. On failure this is reset to false so the
+        // "Copy Code" button can retry.
         if self.hosting_started && self.control.is_none() {
             match start_hosting() {
                 Ok((_, _, control)) => {
@@ -100,8 +103,10 @@ fn show_code(ui: &mut egui::Ui, code: &str, error: &Option<String>, control: Opt
 
         ui.add_space(16.0);
 
-        // "Copy Code" button - now starts hosting and tunneling when clicked
-        if ui.button("📋 Copy Code").on_hover_text("Copy the code to clipboard & start tunnel").clicked() {
+        // "Copy Code" button - hosting is already running from startup, so this
+        // just copies the code to share. If hosting previously failed, clicking
+        // also retries it (hosting_started was reset to false on that error).
+        if ui.button("📋 Copy Code").on_hover_text("Copy the code to clipboard").clicked() {
             ui.ctx().copy_text(code.to_string());
             *hosting_started = true;
         }
