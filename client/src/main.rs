@@ -1079,6 +1079,24 @@ fn format_log_time(timestamp_ms: u64) -> String {
     }
 }
 
+/// Draw one on/off feature toggle and return whether it was clicked this
+/// frame. While `on`, the button gets a filled green background so its state
+/// reads at a glance from color, not just the "On"/"Off" in the label. While
+/// `pending` (waiting on the host's ack) it's disabled, so a slow reply can't
+/// be raced by a second click.
+fn toggle_button(ui: &mut egui::Ui, label: &str, on: bool, pending: bool) -> bool {
+    let mut button = egui::Button::new(label);
+    if on {
+        // A solid green ground, distinct from the default grey "off" button
+        // in both light and dark themes; white text keeps it readable on the
+        // fill.
+        button = button
+            .fill(egui::Color32::from_rgb(46, 125, 50))
+            .stroke(egui::Stroke::NONE);
+    }
+    ui.add_enabled(!pending, button).clicked()
+}
+
 /// Renders the connected view (remote screen + controls).
 /// Returns false when the caller should drop back to the connect form
 /// (user clicked Disconnect, or the connection died).
@@ -1219,7 +1237,7 @@ fn show_connected(
                 };
                 (label, status.pending, status.blocked)
             };
-            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+            if toggle_button(ui, label, blocked, pending) {
                 session.guest_input.lock().unwrap().pending = true;
                 let _ = write_message(
                     &mut session.stream,
@@ -1244,7 +1262,7 @@ fn show_connected(
                 };
                 (label, status.pending, status.enabled, status.error.clone())
             };
-            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+            if toggle_button(ui, label, enabled, pending) {
                 session.keystroke_log.lock().unwrap().pending = true;
                 let _ = write_message(
                     &mut session.stream,
@@ -1272,7 +1290,7 @@ fn show_connected(
                 };
                 (label, status.pending, status.enabled, status.error.clone())
             };
-            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+            if toggle_button(ui, label, enabled, pending) {
                 session.clipboard_sync.lock().unwrap().pending = true;
                 let _ = write_message(
                     &mut session.stream,
@@ -1350,6 +1368,30 @@ fn show_connected(
         handle_input(ui, ctx, session, rect, response);
     } else {
         ui.centered_and_justified(|ui| ui.label("Waiting for first frame..."));
+    }
+
+    // While a refresh is in flight - from the click until the host's
+    // RefreshScreenResult arrives (handled in the receiver thread) - show a
+    // spinner centered over the window as a "working..." indicator. The host's
+    // frames may have stalled (exactly the situation refresh recovers from),
+    // so we keep requesting repaints to animate the spinner until `pending`
+    // clears. Drawn on the foreground layer via an Area so it floats over the
+    // remote frame; non-interactable so it doesn't eat clicks.
+    if session.refresh.lock().unwrap().pending {
+        egui::Area::new(egui::Id::new("refresh-spinner-overlay"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.add(egui::Spinner::new().size(48.0));
+                    });
+            });
+        ctx.request_repaint();
     }
 
     keep_going
@@ -1473,7 +1515,19 @@ fn spawn_connect(
 ) {
     std::thread::spawn(move || {
         let outcome = connect(&address, &password)
-            .map(|(stream, w, h)| {
+            .map(|(mut stream, w, h)| {
+                // Block this client's input at the host from the moment we
+                // connect: "view only" is the default, so an accidental click
+                // or keystroke can't land on the host until the operator
+                // explicitly enables input. The host acks with
+                // GuestInputBlockedResult, which clears the `pending` flag set
+                // on `guest_input` below. Safe to write here - this thread
+                // solely owns `stream` until the finished Session is handed to
+                // the UI thread, and the receiver thread only reads.
+                let _ = write_message(
+                    &mut stream,
+                    &ClientMessage::BlockGuestInput { blocked: true },
+                );
                 let shared = Arc::new(Mutex::new(SharedFrame {
                     width: 0,
                     height: 0,
@@ -1487,8 +1541,11 @@ fn spawn_connect(
                     error: None,
                 }));
                 let guest_input = Arc::new(Mutex::new(GuestInputStatus {
-                    blocked: false,
-                    pending: false,
+                    // On by default (input blocked), matching the
+                    // BlockGuestInput request sent above; `pending` stays true
+                    // until the host's GuestInputBlockedResult ack arrives.
+                    blocked: true,
+                    pending: true,
                 }));
                 let keystroke_status = Arc::new(Mutex::new(KeystrokeLogStatus {
                     enabled: false,
