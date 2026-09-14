@@ -19,7 +19,6 @@
 
 mod blank_screen;
 mod clipboard_sync;
-mod gui;
 mod gui_core;
 mod keylogger;
 mod lock_host;
@@ -50,27 +49,17 @@ fn generate_random_password() -> String {
         .collect()
 }
 
-pub fn generate_random_code() -> String {
-    use rand::Rng;
-    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-    let mut rng = rand::thread_rng();
-    (0..6)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
-        .collect()
-}
-
 fn print_help() {
     println!("rd-host [mode] [options]");
     println!();
-    println!("With no arguments, opens a visible window showing a connection code");
-    println!("that you can copy. Close the window to minimize to system tray.");
+    println!("With no arguments, runs in the system tray (no window). Right-click the");
+    println!("tray icon to copy the address/password, open the connection log, or quit.");
+    println!("The address and password are also appended to rd-host-connections.log next");
+    println!("to the executable once the ngrok tunnel finishes starting (or gives up).");
     println!();
     println!("  --tray");
-    println!("      Run in system tray mode instead (no window). Right-click the");
-    println!("      tray icon to copy the address/password, open the connection log,");
-    println!("      or quit. The address and password are also appended to");
-    println!("      rd-host-connections.log next to the executable once the ngrok");
-    println!("      tunnel finishes starting (or gives up).");
+    println!("      Explicitly select tray mode. Same as passing no arguments; accepted");
+    println!("      so existing auto-start entries that pass --tray keep working.");
     println!();
     println!("  --setup-autostart");
     println!("      Configure the app to start automatically in system tray mode");
@@ -143,13 +132,20 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
     match mode.as_str() {
-        "" => {
-            if let Err(e) = gui::run() {
-                eprintln!("Failed to open GUI: {e}");
-                std::process::exit(1);
+        // No arguments runs the tray (the only interactive mode now); --tray
+        // is kept as an explicit alias so existing auto-start registry entries
+        // that pass it keep working.
+        "" | "--tray" => {
+            // Register for launch-on-boot every time the app starts in tray
+            // mode, so just running it once is enough - no manual
+            // --setup-autostart step needed. Idempotent (it overwrites the
+            // Run entry with the current exe path, self-healing if the exe
+            // moved) and best-effort: a failure here must not stop the app
+            // from running now. `--remove-autostart` still deletes the entry,
+            // but note the next tray launch re-adds it.
+            if let Err(e) = setup_autostart() {
+                eprintln!("Could not register auto-start: {e}");
             }
-        }
-        "--tray" => {
             if let Err(e) = tray::run() {
                 eprintln!("Failed to start: {e}");
                 std::process::exit(1);

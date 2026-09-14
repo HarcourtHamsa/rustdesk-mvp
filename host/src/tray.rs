@@ -9,7 +9,7 @@
 //!
 //! Windows-only, same as `blank_screen.rs` - there's no tray-icon
 //! implementation wired up here for macOS/Linux, so `run()` just returns
-//! an error there telling you to use `rd-host listen`/`--window` instead.
+//! an error there telling you to use `rd-host listen` instead.
 
 #[cfg(windows)]
 mod imp {
@@ -458,7 +458,7 @@ mod imp {
     pub fn run() -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "the tray/background mode is Windows-only for now - use `rd-host listen` or `rd-host --window` instead",
+            "the tray/background mode is Windows-only for now - use `rd-host listen` instead",
         ))
     }
 }

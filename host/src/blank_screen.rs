@@ -307,16 +307,14 @@ mod imp {
 
     fn create_overlay_window() -> Result<HWND, String> {
         unsafe {
-            // In `rd-host`'s GUI mode, eframe/winit already declares DPI
-            // awareness at startup, so GetSystemMetrics below already
-            // returns true physical pixels. But CLI mode (`listen`/`relay`)
-            // never touches DPI awareness at all - without this call,
-            // GetSystemMetrics returns DPI-*virtualized* (scaled-down)
-            // dimensions there, sizing this window smaller than the real
-            // screen and leaving a border of real desktop (and its normal
-            // cursor) visible around the edges. Harmless if it's already
-            // been set (by eframe, or a previous call here) - Windows only
-            // honors the first attempt per process either way.
+            // Ensure the process is DPI-aware so GetSystemMetrics below
+            // returns true physical pixels rather than DPI-*virtualized*
+            // (scaled-down) dimensions - the latter would size this overlay
+            // smaller than the real screen, leaving a border of real desktop
+            // (and its normal cursor) visible around the edges. `main()`
+            // already sets this at startup for every mode, so this is
+            // normally a no-op; it stays as cheap insurance, since Windows
+            // only honors the first attempt per process either way.
             SetProcessDPIAware();
 
             let hinstance = GetModuleHandleW(std::ptr::null());

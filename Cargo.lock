@@ -3359,8 +3359,6 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "dotenvy",
- "eframe",
- "egui",
  "enigo",
  "image 0.24.9",
  "ngrok",

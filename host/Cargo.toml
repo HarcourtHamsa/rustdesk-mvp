@@ -14,8 +14,6 @@ scrap = "0.5"
 image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
 enigo = "0.1"
 rand = "0.8"
-eframe = "0.35.0"
-egui = "0.35.0"
 arboard = "3"
 ngrok = "0.19.0"
 tokio = { version = "1.53.1", features = ["rt", "net", "time"] }
