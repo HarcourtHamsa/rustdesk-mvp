@@ -1196,8 +1196,6 @@ fn show_connected(
             // client keeps seeing/controlling it. Host-side support is
             // Windows-only; other hosts reply with an error, shown below
             // the row rather than the toggle just silently doing nothing.
-            // COMMENTED OUT: Feature disabled
-            /*
             let (label, pending, enabled, err) = {
                 let status = session.blank_screen.lock().unwrap();
                 let label = if status.pending {
@@ -1209,7 +1207,7 @@ fn show_connected(
                 };
                 (label, status.pending, status.enabled, status.error.clone())
             };
-            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+            if toggle_button(ui, label, enabled, pending) {
                 session.blank_screen.lock().unwrap().pending = true;
                 let _ = write_message(
                     &mut session.stream,
@@ -1219,7 +1217,6 @@ fn show_connected(
             if let Some(e) = err {
                 errors.push(format!("Blank host screen: {e}"));
             }
-            */
 
             // "Block guest input" toggle: while on, this client's mouse/
             // keyboard stop reaching the host (it keeps streaming frames
@@ -1681,17 +1678,11 @@ fn spawn_frame_receiver(
                         guard.version = v;
                     }
                 }
-                // COMMENTED OUT: Blank screen feature disabled
-                /*
                 Ok(HostMessage::BlankScreenResult { enabled, ok, reason }) => {
                     let mut status = blank_screen.lock().unwrap();
                     status.pending = false;
                     status.enabled = enabled;
                     status.error = if ok { None } else { reason };
-                }
-                */
-                Ok(HostMessage::BlankScreenResult { .. }) => {
-                    // Ignore blank screen result messages
                 }
                 Ok(HostMessage::GuestInputBlockedResult { blocked }) => {
                     let mut status = guest_input.lock().unwrap();
