@@ -56,9 +56,9 @@ mod imp {
     };
     use winapi::shared::windef::HCURSOR;
     use winapi::um::winuser::{
-        BeginPaint, CreateCursor, DefWindowProcW, DispatchMessageW, DrawTextW, EndPaint,
-        GetClientRect, GetMessageW, GetSystemMetrics, InvalidateRect, KillTimer, LoadCursorW,
-        PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetProcessDPIAware,
+        BeginPaint, CreateCursor, DefWindowProcW, DispatchMessageW, DrawTextW, EnableWindow,
+        EndPaint, GetClientRect, GetMessageW, GetSystemMetrics, InvalidateRect, KillTimer,
+        LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetProcessDPIAware,
         SetSystemCursor, SetTimer, ShowCursor, ShowWindow, SystemParametersInfoW,
         TranslateMessage, UpdateWindow, CW_USEDEFAULT, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
         HTTRANSPARENT, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS,
@@ -395,6 +395,16 @@ mod imp {
             // keyboard input while blanked.
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             UpdateWindow(hwnd);
+
+            // Leave the overlay disabled the whole time it's shown. It never
+            // needs to receive input itself, and being disabled lets the input
+            // loop's ChildWindowFromPointEx(..., CWP_SKIPDISABLED) lookup step
+            // straight over it to the real window underneath, so the client's
+            // mouse input can be posted there directly while blanked (see
+            // main.rs's `input_bypass`). Disabling doesn't affect painting, so
+            // the fake update screen keeps animating, and posted messages like
+            // WM_CLOSE (used by `disable`) are still delivered.
+            EnableWindow(hwnd, 0);
 
             // Starts this activation's fake update clock at 0% and kicks
             // off the repaint timer that animates the spinner and advances
