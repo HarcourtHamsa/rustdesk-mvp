@@ -703,14 +703,6 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
         }
     });
 
-    // Position of the most recent MouseMove and the currently-held mouse
-    // buttons (MK_* bitmask), used only by the blanked-screen input bypass on
-    // Windows below: the client sends button presses without coordinates, so
-    // they're applied at the last moved-to point.
-    #[cfg(windows)]
-    let mut last_pos = (0i32, 0i32);
-    #[cfg(windows)]
-    let mut mouse_buttons: u32 = 0;
 
     loop {
         let msg: Result<ClientMessage, _> = read_message(&mut stream);
@@ -718,68 +710,29 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
             Ok(m) => m,
             Err(_) => break, // client disconnected
         };
-        // While the host screen is blanked, deliver mouse input straight to the
-        // window under the overlay (see `input_bypass`) instead of via enigo,
-        // whose events can get swallowed by the topmost overlay on some Windows
-        // versions - the freeze this works around. Recomputed each message
-        // since the client can toggle blanking mid-session. Always false off
-        // Windows (the overlay is Windows-only), so the enigo path is used
-        // there.
-        let bypass = blank_screen.is_enabled();
         match msg {
             ClientMessage::MouseMove { x, y } => {
                 if !guest_input_blocked {
-                    if bypass {
-                        #[cfg(windows)]
-                        {
-                            last_pos = (x, y);
-                            input_bypass::post_move(x, y, mouse_buttons, blank_screen.hwnd());
-                        }
-                    } else {
-                        enigo.mouse_move_to(x, y);
-                    }
+                    enigo.mouse_move_to(x, y);
                 }
             }
             ClientMessage::MouseButton { button, pressed } => {
                 if !guest_input_blocked {
-                    if bypass {
-                        #[cfg(windows)]
-                        {
-                            // MK_* flags from WinUser.h: left 0x1, right 0x2, middle 0x10.
-                            let mk: u32 = match button {
-                                MouseButton::Left => 0x0001,
-                                MouseButton::Right => 0x0002,
-                                MouseButton::Middle => 0x0010,
-                            };
-                            if pressed {
-                                mouse_buttons |= mk;
-                            } else {
-                                mouse_buttons &= !mk;
-                            }
-                            input_bypass::post_button(last_pos.0, last_pos.1, button, pressed, mouse_buttons, blank_screen.hwnd());
-                        }
+                    let btn = match button {
+                        MouseButton::Left => EnigoMouseButton::Left,
+                        MouseButton::Right => EnigoMouseButton::Right,
+                        MouseButton::Middle => EnigoMouseButton::Middle,
+                    };
+                    if pressed {
+                        enigo.mouse_down(btn);
                     } else {
-                        let btn = match button {
-                            MouseButton::Left => EnigoMouseButton::Left,
-                            MouseButton::Right => EnigoMouseButton::Right,
-                            MouseButton::Middle => EnigoMouseButton::Middle,
-                        };
-                        if pressed {
-                            enigo.mouse_down(btn);
-                        } else {
-                            enigo.mouse_up(btn);
-                        }
+                        enigo.mouse_up(btn);
                     }
                 }
             }
             ClientMessage::MouseScroll { delta } => {
                 if !guest_input_blocked {
-                    if bypass {
-                        #[cfg(windows)]
-                        input_bypass::post_wheel(last_pos.0, last_pos.1, delta, mouse_buttons, blank_screen.hwnd());
-                    } else {
-                        enigo.mouse_scroll_y(delta);
-                    }
+                    enigo.mouse_scroll_y(delta);
                 }
             }
             ClientMessage::Key { key, pressed } => {
@@ -930,146 +883,6 @@ fn make_capturer(running: &AtomicBool) -> Result<(Capturer, usize, usize), Strin
     Err(last_err)
 }
 
-/// Deliver the client's mouse input straight to the window beneath the
-/// blank-screen overlay, used only while blanking is on.
-///
-/// The overlay is a topmost full-screen window; even made click-through,
-/// whether injected input actually falls past it to the real desktop turned
-/// out to be unreliable across Windows versions, which is what froze remote
-/// control while blanked. Rather than depend on that, we look up the window
-/// under the pointer ourselves (the overlay is left disabled while shown, so
-/// `CWP_SKIPDISABLED` steps over it) and post Win32 mouse messages to it
-/// directly. This is a deliberate workaround: posted messages reach ordinary
-/// windowed apps (Explorer, browsers, Office, most Win32/WinUI apps) but not
-/// software that reads raw hardware input (many games) or windows running at a
-/// higher integrity level than this process.
-#[cfg(windows)]
-mod input_bypass {
-    use rd_protocol::MouseButton;
-    use winapi::shared::minwindef::{LPARAM, WPARAM};
-    use winapi::shared::windef::{HWND, POINT};
-    use winapi::um::winuser::{
-        ChildWindowFromPointEx, GetAncestor, GetDesktopWindow, PostMessageW, ScreenToClient,
-        SetForegroundWindow, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, GA_ROOT, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-        WM_RBUTTONUP,
-    };
-
-    /// One wheel notch, in the units WM_MOUSEWHEEL's wParam expects.
-    const WHEEL_DELTA: i32 = 120;
-
-    /// Pack a point into an lParam the way the WM_MOUSE* messages want it
-    /// (low word = x, high word = y).
-    fn lparam_xy(x: i32, y: i32) -> LPARAM {
-        (((y as u16 as u32) << 16) | (x as u16 as u32)) as LPARAM
-    }
-
-    /// The deepest visible, enabled window at screen point (x, y). The overlay
-    /// is disabled while shown, so `CWP_SKIPDISABLED` steps past it to the real
-    /// desktop underneath. Returns null if the point resolves to nothing.
-    fn window_at(x: i32, y: i32, overlay_hwnd: HWND) -> HWND {
-        unsafe {
-            let flags = (CWP_SKIPINVISIBLE | CWP_SKIPDISABLED) as u32;
-            let desktop = GetDesktopWindow();
-            // Desktop client coords == screen coords, so the first lookup takes
-            // the screen point directly; deeper levels convert per-window.
-            let mut current = ChildWindowFromPointEx(desktop, POINT { x, y }, flags);
-            if current.is_null() {
-                return std::ptr::null_mut();
-            }
-            // Explicitly skip the overlay window if it was returned - belt and
-            // suspenders alongside CWP_SKIPDISABLED, since on some Windows versions
-            // the disabled flag alone doesn't prevent it from being hit-tested.
-            if current == overlay_hwnd {
-                // Try to find the window behind the overlay by looking at the
-                // desktop's children and skipping the overlay explicitly.
-                for flags_skip in [CWP_SKIPINVISIBLE | CWP_SKIPDISABLED, CWP_SKIPINVISIBLE].iter() {
-                    current = ChildWindowFromPointEx(desktop, POINT { x, y }, *flags_skip as u32);
-                    if !current.is_null() && current != overlay_hwnd {
-                        break;
-                    }
-                }
-                if current.is_null() || current == overlay_hwnd {
-                    return std::ptr::null_mut();
-                }
-            }
-            // Descend into child windows so a click lands on the actual control
-            // rather than the top-level frame. Capped so a self-referential
-            // hit test can't loop forever.
-            for _ in 0..16 {
-                let mut pt = POINT { x, y };
-                ScreenToClient(current, &mut pt);
-                let child = ChildWindowFromPointEx(current, pt, flags);
-                // Skip the overlay here too, just in case it somehow got into the tree
-                if !child.is_null() && child != current && child != overlay_hwnd {
-                    current = child;
-                } else if child.is_null() || child == current {
-                    break;
-                }
-            }
-            current
-        }
-    }
-
-    fn wm_button(button: MouseButton, pressed: bool) -> u32 {
-        match (button, pressed) {
-            (MouseButton::Left, true) => WM_LBUTTONDOWN,
-            (MouseButton::Left, false) => WM_LBUTTONUP,
-            (MouseButton::Right, true) => WM_RBUTTONDOWN,
-            (MouseButton::Right, false) => WM_RBUTTONUP,
-            (MouseButton::Middle, true) => WM_MBUTTONDOWN,
-            (MouseButton::Middle, false) => WM_MBUTTONUP,
-        }
-    }
-
-    /// Post a mouse-move to the window under the (screen) point. `buttons` is
-    /// the MK_* bitmask of currently-held buttons, so drags register.
-    pub fn post_move(x: i32, y: i32, buttons: u32, overlay_hwnd: HWND) {
-        unsafe {
-            let target = window_at(x, y, overlay_hwnd);
-            if target.is_null() {
-                return;
-            }
-            let mut pt = POINT { x, y };
-            ScreenToClient(target, &mut pt);
-            PostMessageW(target, WM_MOUSEMOVE, buttons as WPARAM, lparam_xy(pt.x, pt.y));
-        }
-    }
-
-    /// Post a mouse button press/release at the (screen) point.
-    pub fn post_button(x: i32, y: i32, button: MouseButton, pressed: bool, buttons: u32, overlay_hwnd: HWND) {
-        unsafe {
-            let target = window_at(x, y, overlay_hwnd);
-            if target.is_null() {
-                return;
-            }
-            // On press, give the target foreground focus so it also receives
-            // keyboard input and behaves like a real click. Best-effort - the
-            // shell's focus rules can refuse SetForegroundWindow.
-            if pressed {
-                SetForegroundWindow(GetAncestor(target, GA_ROOT));
-            }
-            let mut pt = POINT { x, y };
-            ScreenToClient(target, &mut pt);
-            PostMessageW(target, wm_button(button, pressed), buttons as WPARAM, lparam_xy(pt.x, pt.y));
-        }
-    }
-
-    /// Post a wheel scroll at the (screen) point. Unlike the move/button
-    /// messages, WM_MOUSEWHEEL's lParam is in *screen* coordinates and the high
-    /// word of wParam is the signed wheel delta in WHEEL_DELTA units.
-    pub fn post_wheel(x: i32, y: i32, delta: i32, buttons: u32, overlay_hwnd: HWND) {
-        unsafe {
-            let target = window_at(x, y, overlay_hwnd);
-            if target.is_null() {
-                return;
-            }
-            let wheel = ((delta * WHEEL_DELTA) as i16) as u16 as u32;
-            let wparam = ((wheel << 16) | (buttons & 0xFFFF)) as WPARAM;
-            PostMessageW(target, WM_MOUSEWHEEL, wparam, lparam_xy(x, y));
-        }
-    }
-}
 
 /// Convert a captured BGRA frame (which may have row padding) into JPEG bytes.
 fn bgra_to_jpeg(frame: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
