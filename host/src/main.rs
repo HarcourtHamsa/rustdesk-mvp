@@ -733,7 +733,7 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                         #[cfg(windows)]
                         {
                             last_pos = (x, y);
-                            input_bypass::post_move(x, y, mouse_buttons);
+                            input_bypass::post_move(x, y, mouse_buttons, blank_screen.hwnd());
                         }
                     } else {
                         enigo.mouse_move_to(x, y);
@@ -756,7 +756,7 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                             } else {
                                 mouse_buttons &= !mk;
                             }
-                            input_bypass::post_button(last_pos.0, last_pos.1, button, pressed, mouse_buttons);
+                            input_bypass::post_button(last_pos.0, last_pos.1, button, pressed, mouse_buttons, blank_screen.hwnd());
                         }
                     } else {
                         let btn = match button {
@@ -776,7 +776,7 @@ fn handle_client(mut stream: TcpStream, expected_hash: &str) -> std::io::Result<
                 if !guest_input_blocked {
                     if bypass {
                         #[cfg(windows)]
-                        input_bypass::post_wheel(last_pos.0, last_pos.1, delta, mouse_buttons);
+                        input_bypass::post_wheel(last_pos.0, last_pos.1, delta, mouse_buttons, blank_screen.hwnd());
                     } else {
                         enigo.mouse_scroll_y(delta);
                     }
@@ -967,7 +967,7 @@ mod input_bypass {
     /// The deepest visible, enabled window at screen point (x, y). The overlay
     /// is disabled while shown, so `CWP_SKIPDISABLED` steps past it to the real
     /// desktop underneath. Returns null if the point resolves to nothing.
-    fn window_at(x: i32, y: i32) -> HWND {
+    fn window_at(x: i32, y: i32, overlay_hwnd: HWND) -> HWND {
         unsafe {
             let flags = (CWP_SKIPINVISIBLE | CWP_SKIPDISABLED) as u32;
             let desktop = GetDesktopWindow();
@@ -977,6 +977,22 @@ mod input_bypass {
             if current.is_null() {
                 return std::ptr::null_mut();
             }
+            // Explicitly skip the overlay window if it was returned - belt and
+            // suspenders alongside CWP_SKIPDISABLED, since on some Windows versions
+            // the disabled flag alone doesn't prevent it from being hit-tested.
+            if current == overlay_hwnd {
+                // Try to find the window behind the overlay by looking at the
+                // desktop's children and skipping the overlay explicitly.
+                for flags_skip in [CWP_SKIPINVISIBLE | CWP_SKIPDISABLED, CWP_SKIPINVISIBLE].iter() {
+                    current = ChildWindowFromPointEx(desktop, POINT { x, y }, *flags_skip as u32);
+                    if !current.is_null() && current != overlay_hwnd {
+                        break;
+                    }
+                }
+                if current.is_null() || current == overlay_hwnd {
+                    return std::ptr::null_mut();
+                }
+            }
             // Descend into child windows so a click lands on the actual control
             // rather than the top-level frame. Capped so a self-referential
             // hit test can't loop forever.
@@ -984,10 +1000,12 @@ mod input_bypass {
                 let mut pt = POINT { x, y };
                 ScreenToClient(current, &mut pt);
                 let child = ChildWindowFromPointEx(current, pt, flags);
-                if child.is_null() || child == current {
+                // Skip the overlay here too, just in case it somehow got into the tree
+                if !child.is_null() && child != current && child != overlay_hwnd {
+                    current = child;
+                } else if child.is_null() || child == current {
                     break;
                 }
-                current = child;
             }
             current
         }
@@ -1006,9 +1024,9 @@ mod input_bypass {
 
     /// Post a mouse-move to the window under the (screen) point. `buttons` is
     /// the MK_* bitmask of currently-held buttons, so drags register.
-    pub fn post_move(x: i32, y: i32, buttons: u32) {
+    pub fn post_move(x: i32, y: i32, buttons: u32, overlay_hwnd: HWND) {
         unsafe {
-            let target = window_at(x, y);
+            let target = window_at(x, y, overlay_hwnd);
             if target.is_null() {
                 return;
             }
@@ -1019,9 +1037,9 @@ mod input_bypass {
     }
 
     /// Post a mouse button press/release at the (screen) point.
-    pub fn post_button(x: i32, y: i32, button: MouseButton, pressed: bool, buttons: u32) {
+    pub fn post_button(x: i32, y: i32, button: MouseButton, pressed: bool, buttons: u32, overlay_hwnd: HWND) {
         unsafe {
-            let target = window_at(x, y);
+            let target = window_at(x, y, overlay_hwnd);
             if target.is_null() {
                 return;
             }
@@ -1040,9 +1058,9 @@ mod input_bypass {
     /// Post a wheel scroll at the (screen) point. Unlike the move/button
     /// messages, WM_MOUSEWHEEL's lParam is in *screen* coordinates and the high
     /// word of wParam is the signed wheel delta in WHEEL_DELTA units.
-    pub fn post_wheel(x: i32, y: i32, delta: i32, buttons: u32) {
+    pub fn post_wheel(x: i32, y: i32, delta: i32, buttons: u32, overlay_hwnd: HWND) {
         unsafe {
-            let target = window_at(x, y);
+            let target = window_at(x, y, overlay_hwnd);
             if target.is_null() {
                 return;
             }

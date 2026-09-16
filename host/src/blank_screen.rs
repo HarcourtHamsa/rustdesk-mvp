@@ -461,6 +461,11 @@ mod imp {
             self.thread.is_some()
         }
 
+        /// Get the current overlay window handle (0 if not active).
+        pub fn hwnd(&self) -> HWND {
+            self.hwnd.load(Ordering::SeqCst) as HWND
+        }
+
         /// Turn the overlay on. A no-op if it's already on.
         pub fn enable(&mut self) -> Result<(), String> {
             if self.thread.is_some() {
