@@ -173,6 +173,11 @@ visible). Right-click it for:
 - **Open Log File** — see below.
 - **Quit** — stops hosting and the tunnel cleanly.
 
+Connection emails are optional. To enable them, set `RESEND_API_KEY` in the
+environment or in a `.env` file next to `rd-host.exe` (the `.env` file is
+ignored by Git). Without it, the host continues normally and logs that the
+email was not sent. Never put an API key in source code or commit it.
+
 Double-clicking the icon shows a quick status popup (addresses + password)
 without needing the full window.
 

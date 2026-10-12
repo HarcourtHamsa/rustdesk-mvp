@@ -30,7 +30,8 @@ pub fn send_connection_email(lan_address: &str, tunnel_address: &str, password: 
             eprintln!("Connection email not sent: could not read RESEND_API_KEY: {error}");
             return;
         }
-    };    let lan = lan_address.to_string();
+    };
+    let lan = lan_address.to_string();
     let tunnel = tunnel_address.to_string();
     let password = password.to_string();
 
